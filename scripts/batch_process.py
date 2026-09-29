@@ -2,14 +2,15 @@
 scripts/batch_process.py - 从 FASTQ 到 MicroDNA 鉴定的全流程
 
 特性:
-  - 默认使用自研 micro_coverage 预扫描流程，彻底解决宏观大片段引入的高假阳性与算力浪费
-  - 支持 --pipeline cnvkit 一键切换为原版 CNVkit 分析
-  - 严格修复 1-based 坐标至 0-based BED 的换算偏移
+  - 智能参数比对机制：自动解析已有 .call.cns 中的参数。若修改了 --fold-change 等参数，自动感知并重新扫描；若参数未变，秒级复用。
+  - 支持 --force-call 显式强制重跑初筛。
+  - 使用流式进度条实时展示深度学习分类进度。
 """
 import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Dict, Tuple
 
 # 确保项目根目录在 sys.path 中
 _PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -17,6 +18,7 @@ if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
 import torch
+from tqdm import tqdm
 
 from config import (
     CNVKIT_TEMP_DIR,
@@ -31,7 +33,7 @@ from config import (
     RAW_DATA_DIR,
 )
 from src.pipeline import get_pipeline
-from src.utils import parse_fasta_file, setup_logger
+from src.utils import iter_fasta_file, setup_logger
 
 _predict_module = None
 
@@ -85,6 +87,41 @@ def find_fastq_pairs(directory: Path):
     return pairs
 
 
+def parse_call_cns_params(call_cns_file: Path) -> Dict[str, str]:
+    """读取 .call.cns 首行的参数指纹字典"""
+    params = {}
+    try:
+        with open(call_cns_file, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+            if first_line.startswith("# params:"):
+                raw_str = first_line.replace("# params:", "").strip()
+                for item in raw_str.split(","):
+                    if "=" in item:
+                        k, v = item.split("=", 1)
+                        params[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return params
+
+
+def can_reuse_call_cns(call_cns_file: Path, expected_params: Dict[str, str]) -> Tuple[bool, str]:
+    """比对已有 call.cns 与当前参数是否严格一致"""
+    if not call_cns_file.exists() or call_cns_file.stat().st_size == 0:
+        return False, "File does not exist or is empty"
+
+    cached_params = parse_call_cns_params(call_cns_file)
+    if not cached_params:
+        return False, "No parameter fingerprint found in existing file"
+
+    for k, v in expected_params.items():
+        if k not in cached_params:
+            return False, f"Missing parameter '{k}' in cached file"
+        if cached_params[k] != v:
+            return False, f"Parameter mismatch: '{k}' (cached={cached_params[k]} vs current={v})"
+
+    return True, "Parameters perfectly match"
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Batch process FASTQ -> MicroDNA",
@@ -104,8 +141,10 @@ def main():
     p.add_argument("--max-cnv-size", type=int, default=None, help="最大候选片段长度 (bp)")
     p.add_argument("--batch-size", type=int, default=256, help="滑窗推理批次大小")
     p.add_argument("--min-region-len", type=int, default=150, help="最终预测最小区域长度")
-    p.add_argument("--cleanup", action="store_true", help="完成后删除中间比对与候选文件")
+    p.add_argument("--cleanup", action="store_true", help="完成后删除中间临时比对与候选文件 (安全保留 call.cns)")
     p.add_argument("--keep-bam", action="store_true", help="cleanup 时保留排序后的 BAM")
+    p.add_argument("--force-align", action="store_true", help="即使已存在有效 BAM，也强制重新执行比对与排序")
+    p.add_argument("--force-call", action="store_true", help="强制重新执行覆盖度初筛计算，忽略参数比对")
     p.add_argument("--model", default=None, help="深度学习模型权重路径")
     p.add_argument("--output-dir", default=str(PREDICTIONS_DIR), help="结果输出目录")
 
@@ -147,7 +186,23 @@ def main():
     for base, r1, r2 in pairs:
         logger.info(f"\n{'='*60}\nProcessing sample: {base} [Pipeline: {args.pipeline}]\n{'='*60}")
         try:
-            call_cns = pipeline.align_and_call(r1, r2, base, threads=args.threads)
+            call_cns_file = temp_dir / f"{base}.call.cns"
+            should_run_call = True
+
+            if not args.force_call and args.pipeline == "micro_coverage":
+                expected_params = pipeline.get_parameter_dict()
+                can_reuse, reason = can_reuse_call_cns(call_cns_file, expected_params)
+                if can_reuse:
+                    logger.info(f"[{base}] Reusing existing '{call_cns_file.name}' (Parameters match current setting).")
+                    call_cns = call_cns_file
+                    should_run_call = False
+                else:
+                    logger.info(f"[{base}] Will re-run coverage profiling. Reason: {reason}.")
+
+            if should_run_call:
+                call_cns = pipeline.align_and_call(
+                    r1, r2, base, threads=args.threads, force_align=args.force_align
+                )
 
             candidates = pipeline.extract_candidates(
                 call_cns,
@@ -173,11 +228,16 @@ def main():
                     pipeline.cleanup_sample(base, keep_bam=args.keep_bam)
                 continue
 
-            records = parse_fasta_file(temp_fa)
             passed_bed = []
             passed_fasta = []
 
-            for rec_header, rec_seq in records:
+            pbar = tqdm(
+                iter_fasta_file(temp_fa),
+                total=n_written,
+                desc=f"Evaluating candidates ({base})",
+                unit="region",
+            )
+            for rec_header, rec_seq in pbar:
                 regions, seq_clean, chrom_info = predict_long_fn(
                     rec_header,
                     rec_seq,
@@ -190,7 +250,6 @@ def main():
                 )
 
                 chrom = chrom_info.get("chrom", "")
-                # 修复 1-based 转 0-based BED 坐标换算
                 if chrom_info.get("has_position", False):
                     base_offset = max(0, chrom_info.get("start", 1) - 1)
                 else:
@@ -203,6 +262,7 @@ def main():
                     passed_fasta.append(
                         (f">{chrom}:{abs_s}-{abs_e}|prob>=limit", seq_clean[rs:re])
                     )
+                pbar.set_postfix({"identified": len(passed_bed)})
 
             final_bed = output_dir / f"{base}_microDNA.bed"
             final_fa = output_dir / f"{base}_microDNA.fasta"

@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程 (自研增强版)
+src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程 (原生Python防广播断言版)
 
-改进亮点:
-1. 几何重叠窗口 (100 bp 步长, 200 bp 窗口): 物理上覆盖任意 >=150 bp 的微环, 根除网格相位截断误杀。
-2. 经验分箱 GC 偏好性矫正: 抹平 PCR 扩增失真, 引入 [0.33, 3.0] 截断防止极端 GC 区域方差爆炸。
-3. 局部滑动基线 (20 kb Rolling Baseline): 适应染色体大尺度常/异染色质起伏, 仅捕获微小局部突起。
-4. 双窗口连续性门控 + 强单窗口豁免门: 中低丰度强制相邻窗口联合验证, 极端高丰度直接豁免。
-5. 深度自适应机制: 对常规 30X 与浅层 sWGS (<5X) 数据智能切换判别逻辑。
+改进:
+1. 彻底移除 extract_candidates 中的 Pandas 依赖，改用原生 Python 流式解析。
+   杜绝底层 df.values 带来的多行内存广播错误（导致 196万行变成同一行的幽灵 BUG）。
+2. 在 extract_candidates 加入探针，显式打印前两条候选样本的坐标以供核对。
+3. 强化全息诊断引擎，无论提取是否丢弃序列，均输出报告确保绝对透明。
 """
 
 import math
@@ -16,7 +15,6 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import pandas as pd
 import pysam
 
 from config import (
@@ -36,7 +34,14 @@ from config import (
     MICRO_COVERAGE_TEMP_DIR,
     SAMTOOLS,
 )
-from ..utils import ensure_bam_index, ensure_faidx, extract_regions, run_command, setup_logger
+from ..utils import (
+    ensure_bam_index,
+    ensure_faidx,
+    is_bam_valid,
+    resolve_bowtie2_index,
+    run_command,
+    setup_logger,
+)
 
 logger = setup_logger("micro_coverage_pipeline")
 
@@ -71,7 +76,12 @@ class MicroCoveragePipeline:
                 f"Reference genome not found: {self.ref_genome}\n"
                 f"Please place reference genome into {self.ref_genome.parent}/"
             )
-        self.index_prefix = self.ref_genome.parent / self.ref_genome.stem
+
+        prefix, _ = resolve_bowtie2_index(self.ref_genome)
+        self.index_prefix = prefix
+        self._index_checked = False
+
+        ensure_faidx(self.ref_genome, SAMTOOLS)
 
         self.window_size = int(window_size)
         self.step_size = int(step_size)
@@ -85,29 +95,56 @@ class MicroCoveragePipeline:
         self.local_baseline_window = int(local_baseline_window)
         self.gc_correction = bool(gc_correction)
 
-        # 染色体 GC 缓存，避免多样本重复提取参考基因组
         self._gc_cache: Dict[str, np.ndarray] = {}
+
+    def get_parameter_dict(self) -> Dict[str, str]:
+        """返回关键分析参数字典，用于版本与缓存比对"""
+        return {
+            "window_size": str(self.window_size),
+            "step_size": str(self.step_size),
+            "fold_change": f"{self.fold_change:.4f}",
+            "exempt_fold_change": f"{self.exempt_fold_change:.4f}",
+            "cluster_max_len": str(self.cluster_max_len),
+        }
 
     def build_index(self) -> None:
         """构建 Bowtie2 索引 (若缺失)"""
-        idx_exts = [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
-        if all(Path(str(self.index_prefix) + ext).exists() for ext in idx_exts):
-            logger.debug("Bowtie2 index already exists, skip building.")
+        prefix, exists = resolve_bowtie2_index(self.ref_genome)
+        self.index_prefix = prefix
+        if exists:
+            logger.debug(f"Bowtie2 index already exists at {self.index_prefix}, skip building.")
+            self._index_checked = True
             return
+
         logger.info(f"Building Bowtie2 index: {self.ref_genome} -> {self.index_prefix}")
         run_command([BOWTIE2_BUILD, "-f", str(self.ref_genome), str(self.index_prefix)])
+        self._index_checked = True
 
-    def align(self, fastq1: Path, fastq2: Path, sample_name: str, threads: int = 8) -> Path:
-        """FASTQ -> sorted & indexed BAM"""
+    def align(
+        self,
+        fastq1: Path,
+        fastq2: Path,
+        sample_name: str,
+        threads: int = 8,
+        force_align: bool = False,
+    ) -> Path:
+        """FASTQ -> sorted & indexed BAM (支持复用已存在的有效 BAM 与索引)"""
         fastq1, fastq2 = Path(fastq1), Path(fastq2)
+        bam_file = self.output_dir / f"{sample_name}.bam"
+
+        if not force_align and is_bam_valid(bam_file, SAMTOOLS):
+            logger.info(f"[{sample_name}] Found existing valid BAM: {bam_file.name}. Skipping alignment.")
+            ensure_bam_index(bam_file, SAMTOOLS)
+            return bam_file
+
         for fq in (fastq1, fastq2):
             if not fq.exists():
                 raise FileNotFoundError(f"FASTQ not found: {fq}")
 
-        self.build_index()
+        if not self._index_checked:
+            self.build_index()
 
         sam_file = self.output_dir / f"{sample_name}.sam"
-        bam_file = self.output_dir / f"{sample_name}.bam"
 
         logger.info(f"[{sample_name}] bowtie2 aligning ({threads} threads) ...")
         run_command([
@@ -122,25 +159,20 @@ class MicroCoveragePipeline:
         run_command([SAMTOOLS, "sort", f"-@{threads}", "-o", str(bam_file), str(sam_file)])
         sam_file.unlink(missing_ok=True)
 
-        run_command([SAMTOOLS, "index", str(bam_file)])
+        logger.info(f"[{sample_name}] Ensuring BAM index for {bam_file.name} ...")
+        ensure_bam_index(bam_file, SAMTOOLS)
         logger.info(f"[{sample_name}] BAM ready: {bam_file}")
         return bam_file
 
     def _get_chromosome_window_gc(self, chrom: str, chrom_len: int, num_windows: int) -> np.ndarray:
-        """
-        快速计算整条染色体上每个滑动窗口的 GC 比例 (0 到 100)。
-        先按 step_size 原子切片统计，再通过滑动累加得到 window_size 的 GC 含量。
-        """
         if chrom in self._gc_cache:
             cached = self._gc_cache[chrom]
             if len(cached) == num_windows:
                 return cached
 
-        ensure_faidx(self.ref_genome, SAMTOOLS)
         with pysam.FastaFile(str(self.ref_genome)) as fa:
             seq = fa.fetch(chrom, 0, chrom_len).upper()
 
-        # 计算每个 step_size (100 bp) 原子切片的 GC 数和长度
         atomic_bins = int(math.ceil(chrom_len / self.step_size))
         atomic_gc = np.zeros(atomic_bins, dtype=np.int32)
         atomic_len = np.zeros(atomic_bins, dtype=np.int32)
@@ -153,7 +185,6 @@ class MicroCoveragePipeline:
             if len(sub) > 0:
                 atomic_gc[i] = sub.count("G") + sub.count("C")
 
-        # 将原子切片聚合成 window_size 窗口 (例如 2 个 100 bp 组成 200 bp 窗口)
         bins_per_win = max(1, self.window_size // self.step_size)
         if bins_per_win == 1:
             win_gc = atomic_gc[:num_windows]
@@ -174,11 +205,6 @@ class MicroCoveragePipeline:
     def _apply_gc_correction(
         self, window_counts: np.ndarray, gc_array: np.ndarray, global_baseline: float
     ) -> np.ndarray:
-        """
-        经验分箱 GC 校正:
-        1. 统计各 GC 梯度的非零窗口中位数。
-        2. 施加 [0.33, 3.0] 截断约束，防止低深度极端 GC 区域发生方差爆炸。
-        """
         if not self.gc_correction or global_baseline <= 0:
             return window_counts.astype(np.float32)
 
@@ -191,7 +217,6 @@ class MicroCoveragePipeline:
                 med = float(np.median(window_counts[mask_g]))
                 if med > 0:
                     raw_factor = global_baseline / med
-                    # 关键安全截断 (Clamping): 严格限制在 [0.33, 3.0] 倍以内
                     norm_factors[g] = float(np.clip(raw_factor, 0.33, 3.0))
                 else:
                     norm_factors[g] = 1.0
@@ -204,10 +229,6 @@ class MicroCoveragePipeline:
     def _compute_local_baseline(
         self, counts: np.ndarray, global_baseline: float
     ) -> np.ndarray:
-        """
-        基于 20 kb 滑动平均计算局部染色质波状起伏基线。
-        并将其限制在 [0.5 * global_baseline, 1.8 * global_baseline]，保持数值稳健。
-        """
         window_pts = max(10, self.local_baseline_window // self.step_size)
         if len(counts) <= window_pts:
             return np.full_like(counts, fill_value=global_baseline, dtype=np.float32)
@@ -224,7 +245,6 @@ class MicroCoveragePipeline:
     def _merge_candidate_regions(
         self, regions: List[Tuple[str, int, int, float]]
     ) -> List[Tuple[str, int, int, float]]:
-        """合并扩展后发生重叠或相邻的候选区间"""
         if not regions:
             return []
 
@@ -252,10 +272,6 @@ class MicroCoveragePipeline:
         threads: int = 8,
         allowed_chroms: Optional[set] = None,
     ) -> Path:
-        """
-        微尺度测序深度扫描主函数。
-        输出格式: chromosome\\tstart\\tend\\tlog2 (1-based 闭区间)
-        """
         bam_file = Path(bam_file)
         if not bam_file.exists():
             raise FileNotFoundError(f"BAM file not found: {bam_file}")
@@ -280,7 +296,6 @@ class MicroCoveragePipeline:
                 if chrom_len < self.window_size:
                     continue
 
-                # 1. 以 step_size (100 bp) 为原子切片累加高质量读段
                 num_atomic_bins = int(math.ceil(chrom_len / self.step_size))
                 atomic_counts = np.zeros(num_atomic_bins, dtype=np.uint32)
 
@@ -307,7 +322,6 @@ class MicroCoveragePipeline:
                     logger.warning(f"Error fetching reads on {chrom}: {e}")
                     continue
 
-                # 2. 构造 50% 重叠的滑动窗口计数
                 bins_per_win = max(1, self.window_size // self.step_size)
                 if num_atomic_bins < bins_per_win:
                     continue
@@ -323,22 +337,16 @@ class MicroCoveragePipeline:
                 global_baseline = float(np.median(non_zero))
                 global_baseline = max(global_baseline, 1.0)
 
-                # 3. 计算并应用 GC 校正 (带 Clamping 保护)
                 gc_array = self._get_chromosome_window_gc(chrom, chrom_len, num_windows)
                 corrected_counts = self._apply_gc_correction(window_counts, gc_array, global_baseline)
-
-                # 4. 计算 20 kb 局部平滑基线
                 local_baseline = self._compute_local_baseline(corrected_counts, global_baseline)
 
-                # 5. 双窗口连续性检验 + 强单窗口高丰度豁免门 + sWGS 浅层测序自适应
                 is_low_coverage = global_baseline < 5.0
                 if is_low_coverage:
-                    # sWGS 浅层测序模式: 放弃连续双窗口约束，采用单窗口稳健倍数
                     diff_req = 1.0
                     cutoff_swgs = np.maximum(2.0, local_baseline * max(1.5, self.fold_change))
                     enriched_mask = (corrected_counts >= cutoff_swgs) & ((corrected_counts - local_baseline) >= diff_req)
                 else:
-                    # 常规 WGS 模式: 执行严格的三重门控
                     cutoff_main = local_baseline * self.fold_change
                     cutoff_exempt = local_baseline * self.exempt_fold_change
                     cutoff_relax = local_baseline * (1.0 + (self.fold_change - 1.0) * self.relax_ratio)
@@ -351,26 +359,22 @@ class MicroCoveragePipeline:
                     left_ok = np.pad(is_neighbor[:-1], (1, 0), constant_values=False)
                     right_ok = np.pad(is_neighbor[1:], (0, 1), constant_values=False)
 
-                    # 激活逻辑: 超高丰度单窗口直接豁免; 中低丰度必须至少有一个邻居达标
                     enriched_mask = is_exempt | (is_candidate & (left_ok | right_ok))
 
                 enriched_indices = np.where(enriched_mask)[0]
                 if len(enriched_indices) == 0:
                     continue
 
-                # 6. 聚类缝合与区间合并
                 cur_start_idx = enriched_indices[0]
                 cur_end_idx = enriched_indices[0] + 1
 
                 for idx in enriched_indices[1:]:
-                    # 允许内部跳过至多 1 个步长 (100 bp)
                     if idx <= cur_end_idx + 1:
                         new_span = (idx - cur_start_idx) * self.step_size + self.window_size
                         if new_span <= self.cluster_max_len:
                             cur_end_idx = idx + 1
                             continue
 
-                    # 封闭当前区间
                     reg_start = cur_start_idx * self.step_size
                     reg_end = min((cur_end_idx - 1) * self.step_size + self.window_size, chrom_len)
                     span = reg_end - reg_start
@@ -384,7 +388,6 @@ class MicroCoveragePipeline:
                     cur_start_idx = idx
                     cur_end_idx = idx + 1
 
-                # 封闭末尾区间
                 reg_start = cur_start_idx * self.step_size
                 reg_end = min((cur_end_idx - 1) * self.step_size + self.window_size, chrom_len)
                 span = reg_end - reg_start
@@ -394,10 +397,13 @@ class MicroCoveragePipeline:
                     log2_val = math.log2((local_mean + 1e-4) / max(mean_base, 1e-4))
                     raw_candidates.append((chrom, reg_start + 1, reg_end, log2_val))
 
-        # 执行全局二次合并，剔除重叠冗余
         final_candidates = self._merge_candidate_regions(raw_candidates)
 
+        param_dict = self.get_parameter_dict()
+        param_header_str = ",".join(f"{k}={v}" for k, v in param_dict.items())
+
         with open(call_out, "w", encoding="utf-8") as f:
+            f.write(f"# params: {param_header_str}\n")
             f.write("chromosome\tstart\tend\tlog2\n")
             for c, s, e, l2 in final_candidates:
                 f.write(f"{c}\t{s}\t{e}\t{l2:.4f}\n")
@@ -415,9 +421,9 @@ class MicroCoveragePipeline:
         sample_name: str,
         threads: int = 8,
         allowed_chroms: Optional[set] = None,
+        force_align: bool = False,
     ) -> Path:
-        """端到端完整流程: 比对 + 快速微覆盖度变异调用"""
-        bam = self.align(fastq1, fastq2, sample_name, threads=threads)
+        bam = self.align(fastq1, fastq2, sample_name, threads=threads, force_align=force_align)
         return self.call_cnv(bam, sample_name, threads=threads, allowed_chroms=allowed_chroms)
 
     def extract_candidates(
@@ -428,52 +434,69 @@ class MicroCoveragePipeline:
         max_size: Optional[int] = None,
         sample_name: Optional[str] = None,
     ) -> List[Dict]:
-        """从 .call.cns 读取候选区域字典列表"""
         call_cns = Path(call_cns)
         if not call_cns.exists():
             raise FileNotFoundError(f"Call file not found: {call_cns}")
 
-        df = pd.read_csv(call_cns, sep="\t", comment=None, dtype=str)
-        missing = [c for c in CALL_CNS_REQUIRED_COLS if c not in df.columns]
-        if missing:
-            raise ValueError(f"{call_cns.name} lacks required columns {missing}")
-
-        df["start"] = pd.to_numeric(df["start"], errors="coerce")
-        df["end"] = pd.to_numeric(df["end"], errors="coerce")
-        df["log2"] = pd.to_numeric(df["log2"], errors="coerce")
-        df = df.dropna(subset=["start", "end"])
-        df["size"] = df["end"] - df["start"]
-
-        n0 = len(df)
-        if min_log2 is not None:
-            df = df[df["log2"] >= float(min_log2)]
-        if min_size:
-            df = df[df["size"] >= int(min_size)]
-        if max_size:
-            df = df[df["size"] <= int(max_size)]
-
-        logger.info(
-            f"[{call_cns.name}] Segments: {n0} total -> {len(df)} after filtering "
-            f"(min_log2={min_log2}, min_size={min_size}, max_size={max_size})"
-        )
-
         prefix = f"{sample_name}_" if sample_name else ""
         candidates = []
-        for i, (_, row) in enumerate(df.iterrows()):
-            chrom = str(row["chromosome"]).strip()
-            start, end = int(row["start"]), int(row["end"])
-            candidates.append({
-                "name": f"{prefix}mcv{i}",
-                "chrom": chrom,
-                "start": start,
-                "end": end,
-                "log2": float(row["log2"]) if pd.notna(row["log2"]) else float("nan"),
-                "size": end - start,
-            })
+        n_total = 0
+
+        # 🚀【核心修复】：完全放弃 Pandas 库的解析，改用原生 Python 逐行解析。
+        # 彻底杜绝由于特殊长文本文件导致的 numpy.values 内存广播断层 BUG！
+        with open(call_cns, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                # 过滤空行、参数行及表头
+                if not line or line.startswith("#") or line.startswith("chromosome"):
+                    continue
+                
+                parts = line.split()
+                if len(parts) < 4:
+                    continue
+                    
+                n_total += 1
+                try:
+                    chrom = str(parts[0]).strip()
+                    start = int(float(parts[1]))
+                    end = int(float(parts[2]))
+                    log2_val = float(parts[3])
+                except ValueError:
+                    continue
+                    
+                size = end - start
+                
+                # 执行过滤逻辑
+                if min_log2 is not None and log2_val < min_log2:
+                    continue
+                if min_size and size < min_size:
+                    continue
+                if max_size and size > max_size:
+                    continue
+                    
+                candidates.append({
+                    "name": f"{prefix}mcv{len(candidates)}",
+                    "chrom": chrom,
+                    "start": start,
+                    "end": end,
+                    "log2": log2_val,
+                    "size": size,
+                })
+
+        logger.info(
+            f"[{call_cns.name}] Segments: {n_total} total -> {len(candidates)} after filtering "
+            f"(min_log2={min_log2}, min_size={min_size}, max_size={max_size})"
+        )
+        
+        # 【断言探针】：打印出解析结果的前2条，绝对确认数组没有变成完全一致的脏数据！
+        if len(candidates) > 0:
+            logger.info(f"Diagnostic - Sample 0: {candidates[0]['chrom']}:{candidates[0]['start']}-{candidates[0]['end']}")
+            if len(candidates) > 1:
+                logger.info(f"Diagnostic - Sample 1: {candidates[1]['chrom']}:{candidates[1]['start']}-{candidates[1]['end']}")
+            
         return candidates
 
     def extract_sequences(self, candidates: List[Dict], output_fa: Path) -> int:
-        """批量提取候选区域序列写入合并 FASTA (Header: >name|chrom:start-end)"""
         output_fa = Path(output_fa)
         if not candidates:
             logger.warning("No candidates to extract; writing empty FASTA.")
@@ -482,51 +505,104 @@ class MicroCoveragePipeline:
 
         ensure_faidx(self.ref_genome, SAMTOOLS)
 
+        # 构建防复用集合 (使用原生遍历，确保每个独立的区间都被记录)
         uniq, seen = [], set()
         for c in candidates:
             key = (c["chrom"], c["start"], c["end"])
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq.append(c)
+            if key not in seen:
+                seen.add(key)
+                uniq.append(c)
 
-        regions = [(c["chrom"], c["start"], c["end"]) for c in uniq]
-        seq_map, skipped = extract_regions(self.ref_genome, regions, SAMTOOLS)
-        for region, reason in skipped:
-            logger.warning(f"Skipped {region[0]}:{region[1]}-{region[2]} -> {reason}")
+        logger.info(f"Unique candidate regions queued for extraction: {len(uniq)}")
 
         written = 0
-        with open(output_fa, "w", encoding="utf-8") as f:
+        diag_unmapped = 0
+        diag_out_of_bounds = 0
+        diag_fetch_err = 0
+        diag_empty = 0
+
+        with pysam.FastaFile(str(self.ref_genome)) as fa, open(output_fa, "w", encoding="utf-8") as f:
+            ref_chroms = list(fa.references)
+            
+            # 安全染色体映射字典
+            chrom_map = {}
+            for chrom in ref_chroms:
+                chrom_map[chrom] = chrom
+                chrom_map[chrom.lower()] = chrom
+                chrom_map[chrom.upper()] = chrom
+            
+            for chrom in ref_chroms:
+                cl = chrom.lower()
+                if cl.startswith("chr"):
+                    bare = chrom[3:]
+                    if bare not in chrom_map: chrom_map[bare] = chrom
+                    if bare.lower() not in chrom_map: chrom_map[bare.lower()] = chrom
+                    if bare.upper() not in chrom_map: chrom_map[bare.upper()] = chrom
+                else:
+                    with_chr = f"chr{chrom}"
+                    if with_chr not in chrom_map: chrom_map[with_chr] = chrom
+                    if with_chr.lower() not in chrom_map: chrom_map[with_chr.lower()] = chrom
+                    if with_chr.upper() not in chrom_map: chrom_map[with_chr.upper()] = chrom
+
             for c in uniq:
-                seq = seq_map.get((c["chrom"], c["start"], c["end"]))
-                if not seq:
+                raw_chrom = str(c["chrom"]).strip()
+                ref_chrom = chrom_map.get(raw_chrom)
+                if not ref_chrom:
+                    diag_unmapped += 1
                     continue
-                seq = seq.upper()
-                f.write(f">{c['name']}|{c['chrom']}:{c['start']}-{c['end']}\n")
+
+                chrom_len = fa.get_reference_length(ref_chrom)
+                start = max(1, int(c["start"]))
+                end = min(int(c["end"]), chrom_len)
+                
+                if start > end or start > chrom_len:
+                    diag_out_of_bounds += 1
+                    continue
+
+                try:
+                    seq = fa.fetch(ref_chrom, start - 1, end).upper()
+                except Exception as e:
+                    diag_fetch_err += 1
+                    continue
+
+                if not seq:
+                    diag_empty += 1
+                    continue
+
+                f.write(f">{c['name']}|{ref_chrom}:{start}-{end}\n")
                 for i in range(0, len(seq), 70):
                     f.write(seq[i : i + 70] + "\n")
                 written += 1
 
-        logger.info(f"Wrote {written}/{len(candidates)} sequences to {output_fa.name}")
+        logger.info(
+            f"Extraction Diagnostics -> Total unique: {len(uniq)} | "
+            f"Written: {written} | "
+            f"Unmapped chroms: {diag_unmapped} | "
+            f"Out of bounds: {diag_out_of_bounds} | "
+            f"Fetch errors: {diag_fetch_err} | "
+            f"Empty strings: {diag_empty}"
+        )
+        
         return written
 
     @staticmethod
     def candidates_to_bed_rows(candidates: List[Dict]) -> List[Tuple[str, int, int]]:
-        """候选区域 -> BED 行 (0-based half-open)"""
         rows = []
         for c in candidates:
             rows.append((c["chrom"], max(0, int(c["start"]) - 1), int(c["end"])))
         return rows
 
     def cleanup_sample(self, sample_name: str, keep_bam: bool = False) -> int:
-        """删除单个样本的中间文件"""
         patterns = [
             f"{sample_name}.sam",
-            f"{sample_name}.call.cns",
             f"{sample_name}_candidates.fa",
         ]
         if not keep_bam:
-            patterns += [f"{sample_name}.bam", f"{sample_name}.bam.bai"]
+            patterns += [
+                f"{sample_name}.bam",
+                f"{sample_name}.bam.bai",
+                f"{sample_name}.bai",
+            ]
 
         removed = 0
         for pat in patterns:

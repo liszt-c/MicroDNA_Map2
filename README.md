@@ -1,6 +1,6 @@
 # MicroDNA Map v2.0
 
-MicroDNA Map v2.0 is an integrated computational platform for extrachromosomal circular DNA (eccDNA / microDNA) identification, annotation, and benchmark evaluation. The framework integrates a 1D ResNet-SelfAttention deep learning classifier, a two-stage sliding-window refinement mechanism, and our novel, in-house developed micro-scale local coverage profiling algorithm (`micro_coverage`) designed specifically to address the physical resolution.
+MicroDNA Map v2.0 is an integrated computational platform for extrachromosomal circular DNA (eccDNA / microDNA) identification, annotation, and benchmark evaluation. The framework integrates a 1D ResNet-SelfAttention deep learning classifier, a two-stage sliding-window refinement mechanism, and micro-scale local coverage profiling algorithm (`micro_coverage`) designed specifically to address the physical resolution of microDNA.
 
 ---
 
@@ -15,10 +15,11 @@ MicroDNA_Map/
 │   └── processed/             # Cleaned datasets (eccDNA.fa, otherDNA.fa)
 ├── refs/                      # Reference genomes and indices
 ├── models/                    # Model checkpoints and training logs
+│   └── cv/                    # 5-fold cross-validation checkpoints and summary metrics
 ├── results/                   # Predictions, metrics, and intermediate outputs
 ├── src/                       # Core algorithm implementation
 │   ├── model.py               # ResNetSelfAttention network architecture
-│   ├── dataloader.py          # Memory-efficient lazy binary-seeking dataset loader
+│   ├── dataloader.py          # Lazy binary-seeking dataset loader with chromosome CV splitting
 │   ├── dataprocess.py         # One-hot encoding and FASTA parsing utilities
 │   ├── hnm.py                 # Multi-round hard negative mining engine
 │   ├── utils.py               # External process execution and file utilities
@@ -28,20 +29,20 @@ MicroDNA_Map/
 ├── scripts/                   # Workflow scripts
 │   ├── process_data.py        # Sequence extraction from coordinate tables
 │   ├── sample_negatives.py    # Genomic background negative sequence sampling
-│   ├── train.py               # Model training with multi-round HNM and AMP
+│   ├── train.py               # Chromosome 5-fold CV training with multi-round HNM and AMP
 │   ├── verify.py              # Performance evaluation and metrics visualization
 │   ├── compare_hnm.py         # HNM probability distribution comparison
-│   ├── predict.py             # High-throughput batch inference
+│   ├── predict.py             # High-throughput batch and ensemble inference
 │   ├── batch_process.py       # End-to-end processing pipeline from FASTQ inputs
 │   └── ablation_layer_size.py # Channel capacity ablation experiments
 └── benchmark/                 # Spike-in simulation, detection, and evaluation
     ├── config_real.yaml       # Real-data spike-in simulation configuration
     ├── config_random.yaml     # Random-data spike-in simulation configuration
     ├── run_benchmark.py       # Orchestrated 10-phase benchmark pipeline
-    ├── microdna_junction_rescuer.py # Split-read head-to-tail junction rescuer
-    ├── perturbation_test.py   # Sequence perturbation and mutagenesis testing
+    ├── microdna_junction_rescuer.py # Head-to-tail junction read rescuer
+    ├── perturbation_test.py   # Sequence feature perturbation and mutagenesis testing
     ├── models_comparison/     # Comparative baselines (ResNet50, Transformer)
-    ├── simulate/              # Circle-seq and WGS read simulation tools
+    ├── simulate/              # Circle-seq and WGS in silico sequencing simulators
     ├── detect/                # Detection wrappers (MicroDNA Map, Circle-Map)
     ├── evaluate/              # Overlap resolution and metrics calculator
     └── visualize/             # Benchmark visualization tools
@@ -80,13 +81,13 @@ Ensure the following external binaries are installed and available in your syste
 
 ### 1. Sequence Inference Prediction (`scripts/predict.py`)
 
-Directly score or scan given FASTA sequences using trained model checkpoints.
+Directly score or scan given FASTA sequences using trained model checkpoints or 5-fold cross-validation soft-ensemble models.
 
 Common Arguments:
 
 * `--input`: Path to input FASTA file or directory containing FASTA files.
 * `--mode`: Inference mode. `short` for fixed-length (400 bp) single-sequence classification; `long` for sliding-window scanning along longer sequences. Default: `long`.
-* `--model`: Path to model weights (`.pth`). Default: `models/best_model.pth`.
+* `--model`: Path to model weights (`.pth`) or a directory containing CV fold weights (e.g., `models/cv`) for ensemble voting. Default: `models/cv` or `models/best_model.pth`.
 * `--limit`: Probability threshold for positive classification. Default: `0.75`.
 * `--batch-size`: Batch size for GPU inference. Default: `512`.
 * `--min-region-len`: Minimum retained candidate length (bp) in `long` mode. Default: `150`.
@@ -97,8 +98,11 @@ Common Arguments:
 # Short sequence mode: Outputs classification probability TSV
 python scripts/predict.py --input data/test_short.fa --mode short --batch-size 512
 
-# Long sequence mode: Scans sequences and outputs candidate BED and FASTA
-python scripts/predict.py --input data/test_long.fa --mode long --limit 0.75 --output-dir results/predictions
+# Long sequence mode (Single model): Scans sequences and outputs candidate BED and FASTA
+python scripts/predict.py --input data/test_long.fa --mode long --model models/best_model.pth --limit 0.75 --output-dir results/predictions
+
+# Long sequence mode (5-Fold Soft Ensemble): Smooths variance across chromosomal folds
+python scripts/predict.py --input data/test_long.fa --mode long --model models/cv --limit 0.75 --output-dir results/predictions
 
 ```
 
@@ -109,6 +113,7 @@ python scripts/predict.py --input data/test_long.fa --mode long --limit 0.75 --o
 Directly segments and scans designated reference genomic regions without read alignment or coverage pre-screening.
 
 Common Arguments:
+
 * `--reference`: Path to reference genome FASTA (must be indexed or indexable via `samtools faidx`).
 * `--output_dir`: Output directory.
 * `--model_path`: Path to model checkpoint. Default: `models/6.pth`.
@@ -130,12 +135,13 @@ python benchmark/detect/run_microdna_map_direct.py \
 
 Processes raw paired-end FASTQ data through read alignment, candidate enrichment pre-screening, and sliding-window neural network classification.
 
-Our project-developed `micro_coverage` algorithm serves as the default backend, specifically designed for the physical size of microDNA (150–1000 bp) by capturing local micro-enrichment bins and clustering them. The  `cnvkit` pipeline remains available as an optional comparative baseline.
+Our project-developed `micro_coverage` algorithm serves as the default backend, specifically designed for the physical size of microDNA (150–1000 bp) by capturing local micro-enrichment bins and clustering them. The `cnvkit` pipeline remains available as an optional comparative baseline.
 
 Common Arguments:
 
 * `--input-dir`: Directory containing paired-end FASTQ files.
 * `--pipeline`: Pre-screening algorithm backend. Options: `micro_coverage` (project-developed micro-scale local coverage scanner, default) or `cnvkit` (traditional macro-CNV calling).
+* `--model`: Path to model checkpoint file or fold directory (`models/cv`) for ensemble voting.
 * `--threads`: Number of CPU threads for alignment and operations.
 * `--limit`: Probability threshold for positive microDNA calls. Default: `0.75`.
 * `--window-size`: Window size (bp) for `micro_coverage` scanning. Default: `200`.
@@ -148,7 +154,7 @@ Common Arguments:
 
 ```bash
 # Default: Self-developed micro_coverage pipeline
-python scripts/batch_process.py --input-dir data/raw --threads 16 --cleanup --keep-bam
+python scripts/batch_process.py --input-dir data/raw --model models/cv --threads 16 --cleanup --keep-bam
 
 # Optional: Traditional CNVkit pipeline
 python scripts/batch_process.py --input-dir data/raw --pipeline cnvkit --threads 16
@@ -191,10 +197,13 @@ python scripts/sample_negatives.py --ratio 1.2 --ref refs/hg19.fa
 
 ### 2. Model Training (`scripts/train.py`)
 
-Trains the ResNet-SelfAttention classifier using multi-round online Hard Negative Mining (HNM) and Automatic Mixed Precision (AMP).
+Trains the ResNet-SelfAttention classifier using balanced chromosome-grouped 5-fold cross-validation, multi-round online Hard Negative Mining (HNM), and Automatic Mixed Precision (AMP).
 
 Common Arguments:
 
+* `--cv`: Run the automated balanced chromosome 5-fold cross-validation pipeline across all 24 human chromosomes.
+* `--fold`: Train only a specific chromosome fold (1 to 5).
+* `--split-mode`: Splitting strategy. Options: `chromosome` (balanced chromosome isolation, default) or `random` (random sequence split).
 * `--base-epochs`: Training epochs for the initial base stage. Default: `30`.
 * `--hnm-rounds`: Iterative HNM rounds (0 disables HNM). Default: `1`.
 * `--hnm-epochs`: Additional training epochs for each HNM round. Default: `20`.
@@ -204,37 +213,72 @@ Common Arguments:
 * `--lr`: Initial learning rate. Default: `0.001`.
 * `--layer-size`: ResNet base channel width. Default: `8`.
 * `--balanced`: Enable weighted random sampling for class balancing.
+* `--output-dir`: Output directory for checkpoints and metrics.
 
 ```bash
+# 1. Automated balanced chromosome-grouped 5-fold cross-validation (Recommended)
 python scripts/train.py \
+    --cv \
     --base-epochs 30 \
-    --hnm-rounds 2 \
+    --hnm-rounds 1 \
     --hnm-epochs 15 \
     --layer-size 8 \
     --balanced \
-    --output-dir models/run_hnm
+    --output-dir models/cv
+
+# 2. Train a single specific chromosome fold (e.g., Fold 1)
+python scripts/train.py \
+    --fold 1 \
+    --base-epochs 30 \
+    --hnm-rounds 1 \
+    --hnm-epochs 15 \
+    --layer-size 8 \
+    --balanced \
+    --output-dir models/fold_1
+
+# 3. Traditional random-split training
+python scripts/train.py \
+    --split-mode random \
+    --base-epochs 30 \
+    --hnm-rounds 1 \
+    --hnm-epochs 15 \
+    --layer-size 8 \
+    --balanced \
+    --output-dir models/run_random
 
 ```
 
 ### 3. Model Evaluation (`scripts/verify.py`)
 
-Quantitatively evaluates model predictions on full datasets, exporting performance metrics and confusion matrices.
+Quantitatively evaluates model predictions on unseen held-out chromosome sets or full datasets, exporting performance reports and confusion matrix plots.
 
 Common Arguments:
 
-* `--model`: Path to model weights (`.pth`).
+* `--model`: Path to model weights (`.pth`) or directory containing CV fold models (`models/cv`).
+* `--fold`: Evaluate exclusively on the held-out test chromosomes of the specified fold (1 to 5).
 * `--threshold`: Decision threshold. Default: `0.5`.
 * `--output-dir`: Directory for evaluation reports and figures.
 * `--no-plot`: Suppress figure generation and export metrics text only.
 
 ```bash
-python scripts/verify.py --model models/best_model.pth --threshold 0.5 --output-dir results/metrics
+# Evaluate a single fold model exclusively on its unseen test chromosomes
+python scripts/verify.py \
+    --model models/cv/fold1_best_model.pth \
+    --fold 1 \
+    --threshold 0.5 \
+    --output-dir results/metrics/fold1
+
+# Evaluate full dataset using 5-fold soft ensemble
+python scripts/verify.py \
+    --model models/cv \
+    --threshold 0.5 \
+    --output-dir results/metrics/ensemble
 
 ```
 
 ### 4. Hard Negative Mining Analysis (`scripts/compare_hnm.py`)
 
-Compares prediction probability distributions between baseline and HNM models to evaluate false positive suppression.
+Compares prediction probability distributions between baseline and HNM models to evaluate false positive suppression and tail polarization.
 
 Common Arguments:
 
@@ -266,17 +310,17 @@ benchmark/
 ├── run_benchmark.py       # Orchestrated 10-phase benchmark pipeline
 ├── microdna_junction_rescuer.py # Head-to-tail junction read rescuer
 ├── perturbation_test.py   # Sequence feature perturbation and mutagenesis testing
-├── models_comparison/     # Comparative model baselines and training scripts
+├── models_comparison/     # Comparative baselines (ResNet50, Transformer)
 ├── simulate/              # Circle-seq and WGS in silico sequencing simulators
-├── detect/                # Tool wrapper scripts (MicroDNA Map, Circle-Map)
+├── detect/                # Detection wrappers (MicroDNA Map, Circle-Map)
 ├── evaluate/              # Overlap resolution and metrics calculation
-└── visualize/             # Benchmark plotting utilities
+└── visualize/             # Benchmark visualization tools
 
 ```
 
-### 1. Ablation Study (`scripts/ablation_layer_size.py`)
+### 1. Channel Capacity Ablation (`scripts/ablation_layer_size.py`)
 
-Tests different base channel configurations to determine optimal model size.
+Tests different base channel configurations to determine optimal network capacity.
 
 Common Arguments:
 
