@@ -4,7 +4,7 @@
 run_benchmark.py
 ================
 
-统一入口，按阶段执行 Spike-in 基准测试。
+统一入口，按阶段执行 Spike-in 基准测试 (BWA-MEM 统一架构版)。
 支持使用逗号分隔指定多个执行阶段，例如:
 python benchmark/run_benchmark.py --config benchmark/config_real.yaml --quick --phase 1,2,3,5,7
 """
@@ -50,7 +50,7 @@ def run_cmd(cmd: List[str], cwd: Optional[Path] = None, dry_run: bool = False) -
 
 
 def check_dependencies() -> Tuple[bool, List[str]]:
-    tools = ["python", "samtools", "bowtie2", "bwa"]
+    tools = ["python", "samtools", "bwa"]
     missing = [t for t in tools if shutil.which(t) is None]
     import importlib.util
     for pkg in ["pysam", "yaml", "torch", "matplotlib", "pandas", "seaborn"]:
@@ -81,28 +81,14 @@ def phase0_check(config: dict, dry_run: bool = False) -> int:
     else:
         print(f"[INFO] FASTA .fai 索引已存在: {fai_file.name}")
 
-    # 2. 检查 / 创建 BWA 索引
+    # 2. 检查 / 创建 BWA 索引 (Circle-Map 与 MicroDNA Map 全局统一所需)
     bwa_exts = [".amb", ".ann", ".bwt", ".pac", ".sa"]
     if not all(Path(str(genome) + ext).exists() for ext in bwa_exts):
-        print(f"[INFO] 正在为 {genome.name} 创建 BWA 索引 (Circle-Map 所需)...")
+        print(f"[INFO] 正在为 {genome.name} 创建 BWA 索引...")
         if not dry_run:
             subprocess.run(["bwa", "index", str(genome)], check=True)
     else:
         print("[INFO] BWA 索引已存在")
-
-    # 3. 检查 / 创建 Bowtie2 索引
-    bt2_prefix = genome.parent / genome.stem
-    bt2_small = [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
-    bt2_large = [".1.bt2l", ".2.bt2l", ".3.bt2l", ".4.bt2l", ".rev.1.bt2l", ".rev.2.bt2l"]
-    has_bt2 = all(Path(str(bt2_prefix) + ext).exists() for ext in bt2_small) or \
-              all(Path(str(bt2_prefix) + ext).exists() for ext in bt2_large)
-
-    if not has_bt2:
-        print(f"[INFO] 正在为 {genome.name} 创建 Bowtie2 索引: {bt2_prefix} ...")
-        if not dry_run:
-            subprocess.run(["bowtie2-build", str(genome), str(bt2_prefix)], check=True)
-    else:
-        print(f"[INFO] Bowtie2 索引已存在: {bt2_prefix}")
 
     model = Path(config["detection"]["microdna_map_model"])
     if not model.exists():

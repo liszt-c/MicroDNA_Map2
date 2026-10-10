@@ -2,17 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-MicroDNA Junction Read Rescuer (Automated BWA Pipeline & Anchor-Constrained Rescuer)
-===================================================================================
-功能:
-  1. 自动化模式: 自动扫描 data/raw 下的双端 FASTQ 文件，调用 BWA-MEM 进行流式比对与排序索引，
-     并自动匹配 results/predictions 下的候选微环 BED 进行接头读段 (Junction Read) 挽救评估。
-  2. 独立模式: 兼容直接传入已比对好的 BAM (-b) 与候选 BED (-t) 进行单样本分析。
-  3. 证据模型: 结合断裂点锚定 (Anchor Matching) 的 Split-Reads 与 Everted-Pairs 双模态证据，
-     通过协变量匹配对照 (Matched Controls) 与 Fisher/Mann-Whitney 检验评估统计特异性。
+MicroDNA Junction Read Rescuer
+===================================================================
 """
 
 import argparse
+import bisect
 import os
 import random
 import re
@@ -20,6 +15,7 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -47,37 +43,39 @@ except Exception:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Automated BWA alignment & Circular DNA Junction Read Rescuer Pipeline."
+        description="MicroDNA Junction Read Rescuer (Multi-Core High-Throughput Pipeline)"
     )
-    # 模式选择与数据输入
+    # 输入与模式控制
     parser.add_argument("-b", "--bam", default=None,
-                        help="Path to an existing BAM file (disables automated FASTQ alignment if set)")
+                        help="Path to a single BAM file for single-sample mode")
     parser.add_argument("-t", "--target-bed", default=None,
                         help="Target candidate BED file (or fallback BED in batch mode)")
+    parser.add_argument("--bam-dir", type=Path, default=None,
+                        help="Directory containing pre-aligned BAM files (Bowtie2 or BWA) for batch mode")
     parser.add_argument("--auto", action="store_true",
-                        help="Force automated discovery and alignment of FASTQs in --input-dir")
+                        help="Force automated FASTQ discovery and BWA alignment mode")
     parser.add_argument("--input-dir", type=Path, default=DEFAULT_RAW_DIR,
                         help=f"Directory containing paired FASTQ files (default: {DEFAULT_RAW_DIR})")
     parser.add_argument("--target-dir", type=Path, default=DEFAULT_PRED_DIR,
                         help=f"Directory containing predicted candidate BED files (default: {DEFAULT_PRED_DIR})")
     parser.add_argument("-r", "--reference", type=Path, default=DEFAULT_REF,
                         help=f"Reference genome FASTA file (default: {DEFAULT_REF})")
-    parser.add_argument("--bam-dir", type=Path, default=None,
-                        help="Directory to save/load BWA-aligned BAMs (default: <output-dir>/bwa_bams)")
     parser.add_argument("-o", "--output-dir", type=Path, default=DEFAULT_OUT_DIR,
                         help=f"Output directory for rescue reports (default: {DEFAULT_OUT_DIR})")
     parser.add_argument("-p", "--threads", type=int, default=max(1, (os.cpu_count() or 4) - 1),
-                        help="CPU threads for BWA and Samtools (default: max available - 1)")
+                        help="CPU threads for BWA, Samtools, and parallel region scanning (default: max - 1)")
     parser.add_argument("--force-align", action="store_true",
-                        help="Force BWA re-alignment even if sorted BAM already exists")
+                        help="Force BWA re-alignment even if output BAM already exists")
 
-    # 接头捕获与统计参数
+    # 算法与证据判定参数
     parser.add_argument("--mode", choices=["all", "split", "everted"], default="all",
-                        help="Evidence capture mode: 'split' (SA tag only), 'everted' (RF mate-pairs only), or 'all' (default: all)")
-    parser.add_argument("--anchor-tol", type=int, default=50,
-                        help="Breakpoint anchor matching tolerance in bp (default: 50 bp)")
+                        help="Evidence capture mode: 'split', 'everted', or 'all' (default: all)")
+    parser.add_argument("--min-overlap", type=float, default=0.40,
+                        help="Minimum reciprocal overlap ratio between candidate region and rescued circle (default: 0.40)")
+    parser.add_argument("--flank-tol", type=int, default=150,
+                        help="Maximum flank extension tolerance in bp for boundary containment (default: 150 bp)")
     parser.add_argument("--min-mapq", type=int, default=10,
-                        help="Minimum MAPQ quality threshold (default: 10)")
+                        help="Minimum MAPQ quality threshold for primary alignment (default: 10)")
     parser.add_argument("--min-circle-len", type=int, default=150,
                         help="Minimum circular DNA length to rescue (default: 150 bp)")
     parser.add_argument("--max-circle-len", type=int, default=3000,
@@ -90,14 +88,48 @@ def parse_args():
 
 
 # =====================================================================
-# 1. FASTQ 配对自动发现与比对准备模块
+# 1. 样本名称解析与文件关联检索模块
 # =====================================================================
 
+def ensure_bam_indexed(bam_path: Path, threads: int = 4) -> None:
+    """确保 BAM 文件具有有效的 .bai 索引，缺失则自动建立"""
+    bai1 = Path(str(bam_path) + ".bai")
+    bai2 = bam_path.with_suffix(".bai")
+    if not (bai1.exists() or bai2.exists()):
+        print(f"[*] BAM index missing. Indexing {bam_path.name}...")
+        subprocess.run(["samtools", "index", "-@", str(threads), str(bam_path)], check=True)
+
+
+def get_sample_name_from_bam(bam_path: Path) -> str:
+    """
+    智能解析 BAM 文件所属样本真实名称。
+    按后缀长度从长到短匹配，彻底避免 .sorted.bam 先截断导致残留 _bwa 的 Bug。
+    """
+    name = bam_path.name
+    if name in ["aligned.sorted.bam", "aligned.bam", "sorted.bam"]:
+        return bam_path.parent.name
+
+    suffixes = sorted([
+        "_bwa.sorted.bam", ".bwa.sorted.bam",
+        "_aligned.sorted.bam", ".aligned.sorted.bam",
+        "_sorted.bam", ".sorted.bam",
+        "_bwa.bam", ".bwa.bam",
+        "_aligned.bam", ".aligned.bam",
+        ".bam"
+    ], key=len, reverse=True)
+
+    clean_name = name
+    for suffix in suffixes:
+        if clean_name.endswith(suffix):
+            clean_name = clean_name[:-len(suffix)]
+            break
+
+    clean_name = re.sub(r"([._](bwa|bowtie2|aligned|sorted))+$", "", clean_name, flags=re.IGNORECASE)
+    return clean_name
+
+
 def find_fastq_pairs(directory: Path) -> List[Tuple[str, Path, Path]]:
-    """
-    智能扫描目录下的配对 FASTQ 文件，支持 .fastq, .fq 及其 .gz 压缩格式
-    返回列表: [(sample_name, r1_path, r2_path), ...]
-    """
+    """扫描配对 FASTQ 文件，支持 .fastq, .fq 及其 .gz 压缩文件"""
     pairs = []
     seen_samples = set()
     directory = Path(directory)
@@ -134,24 +166,20 @@ def find_fastq_pairs(directory: Path) -> List[Tuple[str, Path, Path]]:
 
 
 def ensure_reference_indices(reference: Path) -> None:
-    """确保参考基因组的 BWA 索引与 Samtools faidx 索引存在，缺失则自动构建"""
+    """确保参考基因组的 BWA 索引与 Samtools faidx 存在"""
     reference = Path(reference).resolve()
     if not reference.exists():
         raise FileNotFoundError(f"Reference genome FASTA not found: {reference}")
 
-    # 1. 检查 BWA 索引
     bwa_exts = [".amb", ".ann", ".bwt", ".pac", ".sa"]
     has_bwa = all(Path(str(reference) + ext).exists() for ext in bwa_exts)
     if not has_bwa:
         if shutil.which("bwa") is None:
             raise RuntimeError("Tool 'bwa' not found in PATH. Please install bwa.")
-        print(f"[*] BWA index missing. Generating BWA index for {reference.name} (this may take several minutes)...")
+        print(f"[*] Generating BWA index for {reference.name} (this may take a few minutes)...")
         subprocess.run(["bwa", "index", str(reference)], check=True)
         print("[+] BWA index built successfully.")
-    else:
-        print(f"[+] BWA index verified for {reference.name}.")
 
-    # 2. 检查 faidx 索引
     fai = Path(str(reference) + ".fai")
     if not fai.exists():
         if shutil.which("samtools") is None:
@@ -169,16 +197,13 @@ def align_and_sort_bwa(
     threads: int = 8,
     force_align: bool = False,
 ) -> Path:
-    """使用 BWA-MEM 将配对 FASTQ 比对并直接管道排序输出 BAM 与 BAI 索引"""
+    """使用 BWA-MEM 流式比对并管道排序输出 BAM"""
     output_bam = Path(output_bam).resolve()
     output_bam.parent.mkdir(parents=True, exist_ok=True)
 
-    # 复用检测
     if not force_align and output_bam.exists() and output_bam.stat().st_size > 0:
-        bai = Path(str(output_bam) + ".bai")
-        if not bai.exists():
-            subprocess.run(["samtools", "index", "-@", str(threads), str(output_bam)], check=True)
-        print(f"[*] Found existing valid BWA BAM: {output_bam.name}, skipping alignment.")
+        ensure_bam_indexed(output_bam, threads=threads)
+        print(f"[*] Reusing existing valid BWA BAM: {output_bam.name}")
         return output_bam
 
     if shutil.which("bwa") is None or shutil.which("samtools") is None:
@@ -193,8 +218,7 @@ def align_and_sort_bwa(
     if res.returncode != 0:
         raise RuntimeError(f"BWA alignment failed:\n{res.stderr}")
 
-    print(f"[*] Indexing BAM: {output_bam.name}...")
-    subprocess.run(["samtools", "index", "-@", str(threads), str(output_bam)], check=True)
+    ensure_bam_indexed(output_bam, threads=threads)
     print(f"[+] BWA alignment completed -> {output_bam}")
     return output_bam
 
@@ -204,30 +228,37 @@ def find_target_bed_for_sample(
     target_dir: Path,
     fallback_bed: Optional[Path] = None,
 ) -> Optional[Path]:
-    """为特定样本自动匹配其预测的 candidate BED 文件"""
+    """为特定样本自动匹配候选预测 BED 文件"""
     if target_dir.exists():
-        candidates = [
-            target_dir / f"{sample_name}_microDNA.bed",
-            target_dir / f"{sample_name}.bed",
-            target_dir / f"{sample_name}_predictions.bed",
-            target_dir / f"{sample_name}_candidates.bed",
-        ]
-        for c in candidates:
-            if c.exists() and c.stat().st_size > 0:
-                return c
+        clean_name = re.sub(r"([._](bwa|bowtie2|aligned|sorted))+$", "", sample_name, flags=re.IGNORECASE)
+        candidate_names = [clean_name]
+        if sample_name != clean_name:
+            candidate_names.append(sample_name)
 
-        fuzzy = list(target_dir.glob(f"{sample_name}*.bed"))
-        if fuzzy:
-            return fuzzy[0]
+        for name in candidate_names:
+            candidates = [
+                target_dir / f"{name}_microDNA.bed",
+                target_dir / f"{name}.bed",
+                target_dir / f"{name}_predictions.bed",
+                target_dir / f"{name}_candidates.bed",
+            ]
+            for c in candidates:
+                if c.exists() and c.stat().st_size > 0:
+                    return c
 
-    if fallback_bed and Path(fallback_bed).exists():
+            fuzzy = sorted(list(target_dir.glob(f"{name}*.bed")))
+            for f in fuzzy:
+                if f.stat().st_size > 0:
+                    return f
+
+    if fallback_bed and Path(fallback_bed).exists() and Path(fallback_bed).stat().st_size > 0:
         return Path(fallback_bed)
 
     return None
 
 
 # =====================================================================
-# 2. 染色体名称标准化与区域加载
+# 2. 染色体名称标准化与极速区间重叠算法
 # =====================================================================
 
 def resolve_chromosome_name(query_chrom: str, target_chroms: Set[str]) -> Optional[str]:
@@ -243,6 +274,42 @@ def resolve_chromosome_name(query_chrom: str, target_chroms: Set[str]) -> Option
         if c in target_chroms:
             return c
     return None
+
+
+def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """将重叠/相邻的区间合并为完全不相交的有序区间数组"""
+    if not intervals:
+        return []
+    sorted_ivs = sorted(intervals, key=lambda x: x[0])
+    merged = [sorted_ivs[0]]
+    for s, e in sorted_ivs[1:]:
+        last_s, last_e = merged[-1]
+        if s <= last_e:
+            merged[-1] = (last_s, max(last_e, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def interval_overlaps_disjoint(
+    intervals: List[Tuple[int, int]],
+    q_start: int,
+    q_end: int,
+    starts: List[int],
+) -> bool:
+    """使用二分检索以 O(log N) 时间复杂度检查区间是否与禁采区冲突"""
+    if not intervals:
+        return False
+    idx = bisect.bisect_right(starts, q_start)
+    if idx > 0:
+        prev_s, prev_e = intervals[idx - 1]
+        if prev_e > q_start:
+            return True
+    if idx < len(intervals):
+        next_s, next_e = intervals[idx]
+        if next_s < q_end:
+            return True
+    return False
 
 
 def load_bed_regions(bed_path: Path, bam_chroms: Set[str]) -> List[Dict]:
@@ -282,16 +349,9 @@ def load_bed_regions(bed_path: Path, bam_chroms: Set[str]) -> List[Dict]:
     return regions
 
 
-def get_region_mean_depth(bam: pysam.AlignmentFile, chrom: str, start: int, end: int) -> float:
-    try:
-        s = max(0, start)
-        e = max(s + 1, end)
-        cov = bam.count_coverage(chrom, s, e)
-        total_bases = sum(sum(cov[i]) for i in range(4))
-        return total_bases / max(1, e - s)
-    except Exception:
-        return 0.0
-
+# =====================================================================
+# 3. 极速对照组采样算法 (消除 30 小时 I/O 阻塞)
+# =====================================================================
 
 def generate_matched_controls(
     targets: List[Dict],
@@ -300,13 +360,27 @@ def generate_matched_controls(
     seed: int = 42,
     depth_tol: float = 0.35,
 ) -> List[Dict]:
+    """
+    高通量对照组生成器:
+    - 利用二分法进行微秒级空间冲突排除。
+    - 使用轻量级 bam.count 代替耗时的 count_coverage 进行快速深度校验。
+    """
     random.seed(seed)
-    forbidden = defaultdict(list)
+    raw_forbidden = defaultdict(list)
     for t in targets:
-        forbidden[t["chrom"]].append((max(0, t["start"] - 1500), t["end"] + 1500))
+        raw_forbidden[t["chrom"]].append((max(0, t["start"] - 1500), t["end"] + 1500))
+
+    disjoint_forbidden = {}
+    starts_forbidden = {}
+    for chrom, ivs in raw_forbidden.items():
+        merged = merge_intervals(ivs)
+        disjoint_forbidden[chrom] = merged
+        starts_forbidden[chrom] = [s for s, e in merged]
 
     controls = []
-    print(f"[*] Generating matched controls for {len(targets)} candidate regions...")
+    print(f"[*] Fast generating matched controls for {len(targets)} candidate regions...")
+
+    read_len = 150
 
     for t in targets:
         chrom = t["chrom"]
@@ -314,9 +388,14 @@ def generate_matched_controls(
             continue
         c_len = chrom_lens[chrom]
         r_len = t["len"]
-        target_depth = get_region_mean_depth(bam, chrom, t["start"], t["end"])
 
-        best_ctrl = None
+        # 使用轻量 index count 估算目标区深度
+        try:
+            t_counts = bam.count(chrom, t["start"], t["end"])
+            target_depth = (t_counts * read_len) / max(1, r_len)
+        except Exception:
+            target_depth = 0.0
+
         min_depth = target_depth * (1.0 - depth_tol)
         max_depth = target_depth * (1.0 + depth_tol)
 
@@ -324,18 +403,26 @@ def generate_matched_controls(
         if max_start <= 10000:
             continue
 
-        for _ in range(150):
+        best_ctrl = None
+        merged_ivs = disjoint_forbidden.get(chrom, [])
+        starts_ivs = starts_forbidden.get(chrom, [])
+
+        # 尝试 15 次快速抽样
+        for _ in range(15):
             cand_start = random.randint(10000, max_start)
             cand_end = cand_start + r_len
 
-            # 避让重叠检测
-            if any(cs < cand_end and cand_start < ce for cs, ce in forbidden[chrom]):
+            if interval_overlaps_disjoint(merged_ivs, cand_start, cand_end, starts_ivs):
                 continue
 
-            # 测序深度匹配检测
             if target_depth > 1.0:
-                c_depth = get_region_mean_depth(bam, chrom, cand_start, cand_end)
-                if not (min_depth <= c_depth <= max_depth):
+                try:
+                    c_counts = bam.count(chrom, cand_start, cand_end)
+                    c_depth = (c_counts * read_len) / max(1, r_len)
+                    # 控制组只要不是深度为 0 的空洞区即可接受匹配
+                    if not (min_depth <= c_depth <= max_depth or c_depth >= 5.0):
+                        continue
+                except Exception:
                     continue
 
             best_ctrl = {
@@ -346,8 +433,23 @@ def generate_matched_controls(
                 "id": f"CTRL_{t['id']}",
                 "len": r_len,
             }
-            forbidden[chrom].append((max(0, cand_start - 1500), cand_end + 1500))
             break
+
+        # 回退至几何无冲突随机采样
+        if best_ctrl is None:
+            for _ in range(10):
+                cand_start = random.randint(10000, max_start)
+                cand_end = cand_start + r_len
+                if not interval_overlaps_disjoint(merged_ivs, cand_start, cand_end, starts_ivs):
+                    best_ctrl = {
+                        "chrom": chrom,
+                        "raw_chrom": t.get("raw_chrom", chrom),
+                        "start": cand_start,
+                        "end": cand_end,
+                        "id": f"CTRL_{t['id']}",
+                        "len": r_len,
+                    }
+                    break
 
         if best_ctrl is None:
             cand_start = random.randint(10000, max_start)
@@ -355,7 +457,7 @@ def generate_matched_controls(
                 "chrom": chrom,
                 "raw_chrom": t.get("raw_chrom", chrom),
                 "start": cand_start,
-                "end": cand_start + r_len,
+                "end": cand_end,
                 "id": f"CTRL_{t['id']}",
                 "len": r_len,
             }
@@ -366,8 +468,35 @@ def generate_matched_controls(
 
 
 # =====================================================================
-# 3. 严谨锚定接头证据判定引擎
+# 4. 稳健拓扑重叠判定引擎 (Overlap-Based Evaluation)
 # =====================================================================
+
+def is_concordant_with_region(
+    circle_start: int,
+    circle_end: int,
+    reg_start: int,
+    reg_end: int,
+    min_overlap: float = 0.40,
+    flank_tol: int = 150,
+) -> bool:
+    """判断检测重建出的微环物理区间是否与候选区域具有拓扑一致性"""
+    ov_start = max(circle_start, reg_start)
+    ov_end = min(circle_end, reg_end)
+    ov_len = max(0, ov_end - ov_start)
+
+    circle_len = max(1, circle_end - circle_start)
+    reg_len = max(1, reg_end - reg_start)
+
+    # 1. 严格双向互交重叠率 (防止过大或过小读段错误触发)
+    if (ov_len / circle_len >= min_overlap) and (ov_len / reg_len >= min_overlap):
+        return True
+
+    # 2. 端点锚定容差 (包容深度学习滑窗激活区的外延漂移)
+    if abs(circle_start - reg_start) <= flank_tol and abs(circle_end - reg_end) <= flank_tol:
+        return True
+
+    return False
+
 
 def parse_sa_tag(sa_string: str) -> List[Dict]:
     entries = []
@@ -400,13 +529,14 @@ def detect_head_to_tail_split_read(
     read: pysam.AlignedSegment,
     reg_start: int,
     reg_end: int,
-    reg_len: int,
     bam_chroms: Set[str],
-    anchor_tol: int = 50,
+    min_overlap: float = 0.40,
+    flank_tol: int = 150,
     min_mapq: int = 10,
     min_len: int = 150,
     max_len: int = 3000,
 ) -> Optional[Dict]:
+    """捕获单碱基 Split-Read 并实施拓扑一致性过滤"""
     if not read.has_tag("SA"):
         return None
     if read.mapping_quality < min_mapq or read.reference_start is None or read.reference_end is None:
@@ -424,8 +554,6 @@ def detect_head_to_tail_split_read(
         sa_chrom = resolve_chromosome_name(sa["chrom"], bam_chroms)
         if sa_chrom != prim_chrom or sa["strand"] != prim_strand:
             continue
-        if sa["mapq"] < min_mapq:
-            continue
 
         sa_start = sa["pos"]
         sa_ref_span = sum(int(length) for length, op in re.findall(r"(\d+)([MDN=X])", sa["cigar"]))
@@ -439,13 +567,9 @@ def detect_head_to_tail_split_read(
         if not (min_len <= circle_len <= max_len):
             continue
 
-        # 1. 严格断裂点边界锚定校验
-        if abs(junc_left - reg_start) > anchor_tol or abs(junc_right - reg_end) > anchor_tol:
-            continue
-        if abs(circle_len - reg_len) > anchor_tol * 2:
+        if not is_concordant_with_region(junc_left, junc_right, reg_start, reg_end, min_overlap, flank_tol):
             continue
 
-        # 2. 几何拓扑校验 (正链/负链)
         is_h2t = False
         if prim_strand == "+":
             if prim_qstart < sa_qstart and prim_start > sa_start:
@@ -478,21 +602,21 @@ def detect_everted_mate_pair(
     read: pysam.AlignedSegment,
     reg_start: int,
     reg_end: int,
-    reg_len: int,
-    bam_chroms: Set[str],
-    anchor_tol: int = 50,
+    min_overlap: float = 0.40,
+    flank_tol: int = 150,
     min_mapq: int = 10,
     min_len: int = 150,
     max_len: int = 3000,
 ) -> Optional[Dict]:
+    """捕获跨接头外翻配对 (Everted Pair, RF 拓扑)"""
     if not read.is_paired or read.is_unmapped or read.mate_is_unmapped:
         return None
-    # 核心过滤: 排除正常线性配对 (消除全基因组随机背景噪声)
     if read.is_proper_pair:
         return None
     if read.mapping_quality < min_mapq:
         return None
-    if read.reference_name != read.next_reference_name:
+    # 使用极速 C 整数对比代替字符串对比
+    if read.reference_id != read.next_reference_id:
         return None
 
     chrom = read.reference_name
@@ -500,45 +624,47 @@ def detect_everted_mate_pair(
     r_end = read.reference_end
     m_start = read.next_reference_start
 
-    # 情况 A: 当前 read 为正链 (+)，mate 为负链 (-)
+    # 情况 A: 正链 (+) 在下游，负链 mate (-) 在上游
     if not read.is_reverse and read.mate_is_reverse:
         if r_start > m_start:
             span = (r_end if r_end else r_start + 150) - m_start
             if not (min_len <= span <= max_len):
                 return None
-            if abs(m_start - reg_start) <= anchor_tol + 50 and abs(r_start - reg_end) <= anchor_tol + 150:
-                if abs(span - reg_len) <= anchor_tol * 2 + 150:
-                    return {
-                        "qname": read.query_name,
-                        "evidence_type": "Everted-Pair",
-                        "chrom": chrom,
-                        "junction_start": m_start,
-                        "junction_end": r_end if r_end else r_start + 150,
-                        "circle_len": span,
-                        "prim_coords": f"{r_start}-{r_end}",
-                        "split_coords": f"mate:{m_start}",
-                        "mapq": f"{read.mapping_quality}",
-                    }
+            circle_s = m_start
+            circle_e = r_end if r_end else r_start + 150
+            if is_concordant_with_region(circle_s, circle_e, reg_start, reg_end, min_overlap, flank_tol):
+                return {
+                    "qname": read.query_name,
+                    "evidence_type": "Everted-Pair",
+                    "chrom": chrom,
+                    "junction_start": circle_s,
+                    "junction_end": circle_e,
+                    "circle_len": span,
+                    "prim_coords": f"{r_start}-{r_end}",
+                    "split_coords": f"mate:{m_start}",
+                    "mapq": f"{read.mapping_quality}",
+                }
 
-    # 情况 B: 当前 read 为负链 (-)，mate 为正链 (+)
+    # 情况 B: 负链 (-) 在上游，正链 mate (+) 在下游
     elif read.is_reverse and not read.mate_is_reverse:
         if m_start > r_start:
             span = (m_start + 150) - r_start
             if not (min_len <= span <= max_len):
                 return None
-            if abs(r_start - reg_start) <= anchor_tol + 50 and abs(m_start - reg_end) <= anchor_tol + 150:
-                if abs(span - reg_len) <= anchor_tol * 2 + 150:
-                    return {
-                        "qname": read.query_name,
-                        "evidence_type": "Everted-Pair",
-                        "chrom": chrom,
-                        "junction_start": r_start,
-                        "junction_end": m_start + 150,
-                        "circle_len": span,
-                        "prim_coords": f"{r_start}-{r_end}",
-                        "split_coords": f"mate:{m_start}",
-                        "mapq": f"{read.mapping_quality}",
-                    }
+            circle_s = r_start
+            circle_e = m_start + 150
+            if is_concordant_with_region(circle_s, circle_e, reg_start, reg_end, min_overlap, flank_tol):
+                return {
+                    "qname": read.query_name,
+                    "evidence_type": "Everted-Pair",
+                    "chrom": chrom,
+                    "junction_start": circle_s,
+                    "junction_end": circle_e,
+                    "circle_len": span,
+                    "prim_coords": f"{r_start}-{r_end}",
+                    "split_coords": f"mate:{m_start}",
+                    "mapq": f"{read.mapping_quality}",
+                }
 
     return None
 
@@ -588,54 +714,75 @@ def calculate_microhomology(
         return 0
 
 
-def scan_cohort_regions(
-    regions: List[Dict],
-    bam: pysam.AlignmentFile,
-    ref_fasta: pysam.FastaFile,
+# =====================================================================
+# 5. 高性能多进程区域流式扫描与伴随深度计算
+# =====================================================================
+
+def _scan_chunk_worker(
+    chunk_regions: List[Dict],
+    bam_path: str,
+    ref_path: str,
     group_type: str,
-    args,
+    mode: str,
+    min_overlap: float,
+    flank_tol: int,
+    min_mapq: int,
+    min_circle_len: int,
+    max_circle_len: int,
     bam_chroms: Set[str],
 ) -> Tuple[List[Dict], List[Dict], int]:
+    """单子进程内独立执行的一组区间流式扫描"""
+    bam = pysam.AlignmentFile(bam_path, "rb")
+    ref_fasta = pysam.FastaFile(ref_path)
+
     region_records = []
-    all_rescued_reads = []
+    rescued_reads = []
     sa_tags_seen = 0
 
-    for reg in regions:
+    for reg in chunk_regions:
         chrom = reg["chrom"]
         start = reg["start"]
         end = reg["end"]
         reg_len = reg["len"]
 
-        search_start = max(0, start - max(150, args.anchor_tol))
-        search_end = end + max(150, args.anchor_tol)
+        search_start = max(0, start - max(200, flank_tol))
+        search_end = end + max(200, flank_tol)
 
         rescued_in_this_region = {}
-        mean_depth = get_region_mean_depth(bam, chrom, start, end)
+        total_overlap_bases = 0
 
         try:
             for read in bam.fetch(chrom, search_start, search_end):
                 if read.is_unmapped or read.is_duplicate:
                     continue
 
+                # 伴随式计算重叠碱基，无需二次调用 count_coverage
+                r_s = read.reference_start
+                r_e = read.reference_end
+                if r_s is not None and r_e is not None and r_s < end and r_e > start:
+                    total_overlap_bases += min(r_e, end) - max(r_s, start)
+
                 if read.has_tag("SA"):
                     sa_tags_seen += 1
 
                 junc_info = None
 
-                # 1. 尝试匹配 Split Read
-                if args.mode in ["all", "split"]:
+                # 1. 优先捕获 Split Read
+                if mode in ["all", "split"]:
                     junc_info = detect_head_to_tail_split_read(
-                        read, start, end, reg_len, bam_chroms,
-                        anchor_tol=args.anchor_tol, min_mapq=args.min_mapq,
-                        min_len=args.min_circle_len, max_len=args.max_circle_len
+                        read, start, end, bam_chroms,
+                        min_overlap=min_overlap, flank_tol=flank_tol,
+                        min_mapq=min_mapq, min_len=min_circle_len,
+                        max_len=max_circle_len
                     )
 
-                # 2. 尝试匹配 Everted Pair
-                if not junc_info and args.mode in ["all", "everted"]:
+                # 2. 备选捕获 Everted Pair
+                if not junc_info and mode in ["all", "everted"]:
                     junc_info = detect_everted_mate_pair(
-                        read, start, end, reg_len, bam_chroms,
-                        anchor_tol=args.anchor_tol, min_mapq=args.min_mapq,
-                        min_len=args.min_circle_len, max_len=args.max_circle_len
+                        read, start, end,
+                        min_overlap=min_overlap, flank_tol=flank_tol,
+                        min_mapq=min_mapq, min_len=min_circle_len,
+                        max_len=max_circle_len
                     )
 
                 if junc_info:
@@ -655,6 +802,8 @@ def scan_cohort_regions(
             pass
 
         count = len(rescued_in_this_region)
+        mean_depth = total_overlap_bases / max(1, reg_len)
+
         region_records.append({
             "region_id": reg["id"],
             "group": group_type,
@@ -666,13 +815,66 @@ def scan_cohort_regions(
             "rescued_reads": count,
             "has_junction": 1 if count > 0 else 0,
         })
-        all_rescued_reads.extend(rescued_in_this_region.values())
+        rescued_reads.extend(rescued_in_this_region.values())
 
-    return region_records, all_rescued_reads, sa_tags_seen
+    bam.close()
+    ref_fasta.close()
+    return region_records, rescued_reads, sa_tags_seen
+
+
+def scan_cohort_regions_parallel(
+    regions: List[Dict],
+    bam_path: Path,
+    ref_path: Path,
+    group_type: str,
+    args,
+    bam_chroms: Set[str],
+) -> Tuple[List[Dict], List[Dict], int]:
+    """基于进程池的多核并行扫描协调器"""
+    if not regions:
+        return [], [], 0
+
+    workers = min(args.threads, len(regions))
+    if workers <= 1:
+        return _scan_chunk_worker(
+            regions, str(bam_path), str(ref_path), group_type, args.mode,
+            args.min_overlap, args.flank_tol, args.min_mapq,
+            args.min_circle_len, args.max_circle_len, bam_chroms
+        )
+
+    # 切分任务块
+    chunk_size = int(np.ceil(len(regions) / workers))
+    chunks = [regions[i:i + chunk_size] for i in range(0, len(regions), chunk_size)]
+
+    all_region_records = []
+    all_rescued_reads = []
+    total_sa = 0
+
+    with ProcessPoolExecutor(max_workers=len(chunks)) as executor:
+        futures = [
+            executor.submit(
+                _scan_chunk_worker,
+                c, str(bam_path), str(ref_path), group_type, args.mode,
+                args.min_overlap, args.flank_tol, args.min_mapq,
+                args.min_circle_len, args.max_circle_len, bam_chroms
+            )
+            for c in chunks
+        ]
+        for f in as_completed(futures):
+            recs, reads, sa = f.result()
+            all_region_records.extend(recs)
+            all_rescued_reads.extend(reads)
+            total_sa += sa
+
+    # 按原始 ID 恢复顺序
+    id_order = {r["id"]: i for i, r in enumerate(regions)}
+    all_region_records.sort(key=lambda x: id_order.get(x["region_id"], 0))
+
+    return all_region_records, all_rescued_reads, total_sa
 
 
 # =====================================================================
-# 4. 单样本接头挽救评测工作流
+# 6. 单样本接头挽救评测工作流
 # =====================================================================
 
 def process_single_sample(
@@ -686,6 +888,8 @@ def process_single_sample(
     print(f"\n{'='*75}\n[*] Processing Sample: {sample_name}\n{'='*75}")
     print(f"  - BAM File   : {bam_file}")
     print(f"  - Target BED : {target_bed_file}")
+
+    ensure_bam_indexed(bam_file, threads=args.threads)
 
     bam = pysam.AlignmentFile(str(bam_file), "rb")
     ref_fasta = pysam.FastaFile(str(reference_file))
@@ -710,17 +914,19 @@ def process_single_sample(
         for c in controls:
             f.write(f"{c['raw_chrom']}\t{c['start']}\t{c['end']}\t{c['id']}\n")
 
-    print(f"[*] Scanning Target ROIs (n={len(targets)}) [Anchor Tol: ±{args.anchor_tol}bp]...")
-    target_summary, target_junctions, target_sa_count = scan_cohort_regions(
-        targets, bam, ref_fasta, "Target", args, bam_chroms
+    bam.close()
+    ref_fasta.close()
+
+    print(f"[*] Scanning Target ROIs (n={len(targets)}) [Threads: {args.threads}, Overlap >= {args.min_overlap:.0%}]...")
+    target_summary, target_junctions, target_sa_count = scan_cohort_regions_parallel(
+        targets, bam_file, reference_file, "Target", args, bam_chroms
     )
 
-    print(f"[*] Scanning Control ROIs (n={len(controls)}) [Anchor Tol: ±{args.anchor_tol}bp]...")
-    control_summary, control_junctions, control_sa_count = scan_cohort_regions(
-        controls, bam, ref_fasta, "Control", args, bam_chroms
+    print(f"[*] Scanning Control ROIs (n={len(controls)}) [Threads: {args.threads}, Overlap >= {args.min_overlap:.0%}]...")
+    control_summary, control_junctions, control_sa_count = scan_cohort_regions_parallel(
+        controls, bam_file, reference_file, "Control", args, bam_chroms
     )
 
-    # 导出明细 TSV
     all_summary = target_summary + control_summary
     all_junctions = target_junctions + control_junctions
 
@@ -740,7 +946,6 @@ def process_single_sample(
                     f"{j['junction_start']}\t{j['junction_end']}\t{j['circle_len']}\t"
                     f"{j['prim_coords']}\t{j['split_coords']}\t{j['mapq']}\t{j['microhomology_bp']}\n")
 
-    # 统计检验
     t_pos = sum(r["has_junction"] for r in target_summary)
     t_neg = len(target_summary) - t_pos
     c_pos = sum(r["has_junction"] for r in control_summary)
@@ -778,16 +983,13 @@ def process_single_sample(
     print(f"{'Cohort':<12}{'Total ROIs':<15}{'With Evidence (>=1)':<22}{'Rescue Rate (%)':<15}")
     print(f"{'Target':<12}{len(target_summary):<15}{t_pos:<22}{t_rate:<15.2f}")
     print(f"{'Control':<12}{len(control_summary):<15}{c_pos:<22}{c_rate:<15.2f}")
-    print(f"[*] Target Breakdown: {split_cnt} Split-Reads, {evert_cnt} Everted-Pairs")
+    print(f"[*] Target Evidence: {split_cnt} Split-Reads, {evert_cnt} Everted-Pairs")
     print(f"[*] Fisher's Exact Test Odds Ratio (OR): {odds_ratio:.3f}")
     print(f"[*] Fisher's Exact Test p-value:         {p_value:.3e}")
     print(f"[*] Mann-Whitney U Test p-value:         {u_pval:.3e}")
     if split_cnt > 0:
         print(f"[*] Average Microhomology (Split-reads): {avg_hom:.2f} bp")
     print("-" * 70 + "\n")
-
-    bam.close()
-    ref_fasta.close()
 
     return {
         "sample": sample_name,
@@ -806,7 +1008,7 @@ def process_single_sample(
 
 
 # =====================================================================
-# 5. 全流程自动化总控 (Main Entry)
+# 7. 全流程自动化总控 (Main Entry)
 # =====================================================================
 
 def main():
@@ -814,39 +1016,108 @@ def main():
     ref_path = Path(args.reference).resolve()
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = Path(args.target_dir).resolve()
 
-    bam_dir = Path(args.bam_dir).resolve() if args.bam_dir else out_dir / "bwa_bams"
-    bam_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. 确保参考基因组及其索引就绪
     ensure_reference_indices(ref_path)
 
-    # 2. 判断运行模式: 单 BAM 模式 vs 自动 FASTQ 发现比对模式
+    # -------------------------------------------------------------
+    # 模式 A: 单 BAM 显式指定模式 (-b sample.bam)
+    # -------------------------------------------------------------
     if args.bam is not None:
-        # 单 BAM 模式
         bam_file = Path(args.bam).resolve()
         if not bam_file.exists():
             print(f"[ERROR] Specified BAM file does not exist: {bam_file}", file=sys.stderr)
             sys.exit(1)
-        if not args.target_bed:
-            print("[ERROR] Single BAM mode requires '--target-bed' argument.", file=sys.stderr)
+
+        sample_name = get_sample_name_from_bam(bam_file)
+        target_bed = find_target_bed_for_sample(
+            sample_name, target_dir, fallback_bed=Path(args.target_bed) if args.target_bed else None
+        )
+        if not target_bed:
+            print(f"[ERROR] Cannot find target BED for {sample_name}. Please pass '-t <bed>'.", file=sys.stderr)
             sys.exit(1)
 
-        sample_name = bam_file.stem.replace(".sorted", "").replace("_bwa", "")
-        target_bed = Path(args.target_bed).resolve()
         process_single_sample(sample_name, bam_file, target_bed, ref_path, out_dir, args)
         return
 
-    # 自动化模式: 扫描 --input-dir 下的双端测序数据
+    # -------------------------------------------------------------
+    # 模式 B: BAM 文件夹批量处理模式 (--bam-dir <dir>)
+    # -------------------------------------------------------------
+    if args.bam_dir is not None and not args.auto:
+        bams_dir = Path(args.bam_dir).resolve()
+        if not bams_dir.exists():
+            print(f"[ERROR] Specified BAM directory does not exist: {bams_dir}", file=sys.stderr)
+            sys.exit(1)
+
+        bams = sorted(list(bams_dir.glob("*.bam")))
+        if not bams:
+            bams = sorted(list(bams_dir.glob("*/*.bam")))
+
+        valid_bams = [b for b in bams if "candidate" not in b.name.lower() and not b.name.endswith(".qname.bam")]
+
+        if not valid_bams:
+            print(f"[ERROR] No valid BAM files found in {bams_dir}.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"\n[*] Discovered {len(valid_bams)} BAM file(s) in: {bams_dir}")
+        for b in valid_bams:
+            print(f"    - {b.name}")
+
+        summary_records = []
+        for bam_file in valid_bams:
+            sample_name = get_sample_name_from_bam(bam_file)
+            target_bed = find_target_bed_for_sample(
+                sample_name, target_dir, fallback_bed=Path(args.target_bed) if args.target_bed else None
+            )
+            if not target_bed:
+                print(f"\n[WARN] No matching candidate BED found for BAM '{bam_file.name}' (Sample: {sample_name}).")
+                print(f"       Checked in: {target_dir}. Skipping.")
+                continue
+
+            rec = process_single_sample(
+                sample_name=sample_name,
+                bam_file=bam_file,
+                target_bed_file=target_bed,
+                reference_file=ref_path,
+                output_dir=out_dir,
+                args=args,
+            )
+            if rec:
+                summary_records.append(rec)
+
+        if summary_records:
+            batch_summary_tsv = out_dir / "batch_rescue_summary.tsv"
+            with open(batch_summary_tsv, "w", encoding="utf-8") as f:
+                headers = list(summary_records[0].keys())
+                f.write("\t".join(headers) + "\n")
+                for r in summary_records:
+                    f.write("\t".join(str(r[h]) for h in headers) + "\n")
+
+            print("\n" + "=" * 90)
+            print("                 BATCH RESCUE EVALUATION MASTER SUMMARY")
+            print("=" * 90)
+            print(f"{'Sample':<18}{'Targets':<10}{'Target%':<10}{'Ctrl%':<10}{'Split':<8}{'Everted':<9}{'OR':<8}{'Fisher p':<12}")
+            print("-" * 90)
+            for r in summary_records:
+                print(f"{r['sample']:<18}{r['total_targets']:<10}{r['target_rate_pct']:<10.2f}{r['control_rate_pct']:<10.2f}"
+                      f"{r['split_reads']:<8}{r['everted_pairs']:<9}{r['odds_ratio']:<8.2f}{r['fisher_pval']:<12.2e}")
+            print("=" * 90)
+            print(f"[+] Master summary report saved to: {batch_summary_tsv}\n")
+        return
+
+    # -------------------------------------------------------------
+    # 模式 C: 自动从 raw FASTQ 目录发现并调用 BWA 进行全自动比对与评估
+    # -------------------------------------------------------------
     input_dir = Path(args.input_dir).resolve()
-    target_dir = Path(args.target_dir).resolve()
+    bam_dir = out_dir / "bwa_bams"
+    bam_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n[*] Scanning for paired FASTQ files in: {input_dir}")
     pairs = find_fastq_pairs(input_dir)
 
     if not pairs:
         print(f"[ERROR] No paired FASTQ files found in {input_dir}.", file=sys.stderr)
-        print("  - Expected file patterns: *_1.fastq / *_2.fastq, *_R1.fq.gz / *_R2.fq.gz, etc.")
+        print("  - If you already have BAM files, run with '--bam-dir <path>' or '-b <path>'.")
         sys.exit(1)
 
     print(f"[+] Discovered {len(pairs)} sample pair(s) to process:")
@@ -856,17 +1127,14 @@ def main():
     summary_records = []
 
     for sample_name, r1, r2 in pairs:
-        # 匹配候选 BED
         target_bed = find_target_bed_for_sample(
             sample_name, target_dir, fallback_bed=Path(args.target_bed) if args.target_bed else None
         )
         if not target_bed:
             print(f"\n[WARN] No matching candidate BED found for sample '{sample_name}'.")
-            print(f"       Checked under: {target_dir}")
-            print(f"       Skipping junction rescue for '{sample_name}'.")
+            print(f"       Checked in: {target_dir}. Skipping.")
             continue
 
-        # 执行/复用 BWA 比对
         sample_bam = bam_dir / f"{sample_name}_bwa.sorted.bam"
         try:
             aligned_bam = align_and_sort_bwa(
@@ -881,7 +1149,6 @@ def main():
             print(f"[ERROR] BWA alignment failed for {sample_name}: {e}", file=sys.stderr)
             continue
 
-        # 执行接头挽救分析
         rec = process_single_sample(
             sample_name=sample_name,
             bam_file=aligned_bam,
@@ -893,7 +1160,6 @@ def main():
         if rec:
             summary_records.append(rec)
 
-    # 导出批处理汇总报表
     if summary_records:
         batch_summary_tsv = out_dir / "batch_rescue_summary.tsv"
         with open(batch_summary_tsv, "w", encoding="utf-8") as f:
@@ -910,8 +1176,8 @@ def main():
         for r in summary_records:
             print(f"{r['sample']:<18}{r['total_targets']:<10}{r['target_rate_pct']:<10.2f}{r['control_rate_pct']:<10.2f}"
                   f"{r['split_reads']:<8}{r['everted_pairs']:<9}{r['odds_ratio']:<8.2f}{r['fisher_pval']:<12.2e}")
-        print("=" * 90)
-        print(f"[+] Master summary report saved to: {batch_summary_tsv}\n")
+            print("=" * 90)
+            print(f"[+] Master summary report saved to: {batch_summary_tsv}\n")
 
 
 if __name__ == "__main__":

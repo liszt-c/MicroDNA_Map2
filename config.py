@@ -1,5 +1,5 @@
 """
-config.py - 全局配置中心 (支持染色体 5 折平衡划分)
+config.py - 全局配置中心 (支持染色体 5 折平衡划分与 BWA-MEM 统一架构)
 """
 from pathlib import Path
 
@@ -70,11 +70,11 @@ LAYER_SIZE = 8                   # ResNet 基础通道数
 # =====================================================================
 NUM_CV_FOLDS = 5
 CHROM_FOLDS = [
-    ["chr1", "chr11", "chr18", "chr19"],               # Fold 1
-    ["chr2", "chr12", "chr17", "chr20"],               # Fold 2
-    ["chr3", "chr9", "chr16", "chr21", "chrY"],        # Fold 3
-    ["chr4", "chr7", "chr14", "chr15", "chr22"],       # Fold 4
-    ["chr5", "chr6", "chr8", "chr10", "chr13", "chrX"],# Fold 5
+    ["chr1", "chr11", "chr18", "chr19"],                # Fold 1
+    ["chr2", "chr12", "chr17", "chr20"],                # Fold 2
+    ["chr3", "chr9", "chr16", "chr21", "chrY"],         # Fold 3
+    ["chr4", "chr7", "chr14", "chr15", "chr22"],        # Fold 4
+    ["chr5", "chr6", "chr8", "chr10", "chr13", "chrX"], # Fold 5
 ]
 
 # 滑动窗口推理参数
@@ -95,7 +95,6 @@ DEFAULT_MICRO_LOCAL_BASELINE_WINDOW = 20000 # 局部滑动基线平滑尺度 (bp
 DEFAULT_MICRO_GC_CORRECTION = True   # 是否开启经验分箱 GC 偏好性校正
 
 # 外部工具路径
-BOWTIE2 = "bowtie2"
-BOWTIE2_BUILD = "bowtie2-build"
+BWA = "bwa"
 SAMTOOLS = "samtools"
 CNVKIT = "cnvkit.py"

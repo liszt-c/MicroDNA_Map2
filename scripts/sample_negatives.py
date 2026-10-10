@@ -2,11 +2,6 @@
 """
 scripts/sample_negatives.py - 从参考基因组中随机采样扩充负例库 (otherDNA)
 
-功能:
-  - 自动避开染色体拼接区、着丝粒等包含 'N' (非 ACGT) 的区域
-  - 支持固定数量扩充 (默认 100,000 条)
-  - 支持基于正负样本比例自动计算缺口并扩充 (如 --ratio 1.5)
-  - 高效批量调用 samtools faidx, 内存占用极小
 """
 import argparse
 import random

@@ -2,13 +2,6 @@
 """
 scripts/ablation_layer_size.py - LAYER_SIZE 消融实验一键运行
 
-功能:
-  - 遍历指定的 LAYER_SIZE 列表, 逐个调用 train.py 的训练逻辑
-  - 每个 LAYER_SIZE 的输出隔离到 models/ablation_layer{N}/
-  - 结果实时追加到 CSV, 中断重跑时自动跳过已完成的 LAYER_SIZE
-  - 支持自定义 batch-size
-  - 支持 --dry-run 预览将要运行的配置
-
 用法:
   python scripts/ablation_layer_size.py --sizes 8 16 32 64
   python scripts/ablation_layer_size.py --dry-run

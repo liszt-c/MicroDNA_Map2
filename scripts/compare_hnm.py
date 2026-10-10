@@ -2,7 +2,6 @@
 """
 scripts/compare_hnm.py - 评估困难负例挖掘(HNM)效果的对比分析工具
 
-功能逻辑分离 (低耦合高内聚):
   - Task 'infer': 加载两个模型权重，在全量数据集上进行流式推理，提取 (Name, Label, Probability) 并保存为独立的 CSV。
   - Task 'plot': 读取已生成的 CSV 文件，使用核密度估计 (KDE) 绘制 2x2 概率分布图，直观展示拖尾消除及正例召回提升效果。
   - Task 'all': 顺序执行上述两步。

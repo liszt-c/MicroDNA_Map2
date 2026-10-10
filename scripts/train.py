@@ -1,12 +1,6 @@
 """
 scripts/train.py - 模型训练入口
 
-支持:
-  1. 平衡型染色体 5 折交叉验证全量自动化执行 (--cv)
-  2. 单独训练/评估指定染色体 Fold (--fold 1..5)
-  3. 保留经典随机拆分模式 (--split-mode random)
-  4. 每折严格在当前 Train 染色体上执行多阶段困难负例挖掘 (HNM)
-  5. 产出综合指标表 (ACC, AUC, Recall, Precision, F1, MCC) 与权重集合
 """
 import argparse
 import random

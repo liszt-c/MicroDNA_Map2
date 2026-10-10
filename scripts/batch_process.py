@@ -1,10 +1,6 @@
 """
 scripts/batch_process.py - 从 FASTQ 到 MicroDNA 鉴定的全流程
 
-特性:
-  - 智能参数比对机制：自动解析已有 .call.cns 中的参数。若修改了 --fold-change 等参数，自动感知并重新扫描；若参数未变，秒级复用。
-  - 支持 --force-call 显式强制重跑初筛。
-  - 使用流式进度条实时展示深度学习分类进度。
 """
 import argparse
 import os

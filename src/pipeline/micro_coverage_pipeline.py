@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程 (原生Python防广播断言版)
+src/pipeline/micro_coverage_pipeline.py - 微尺度局部覆盖度分析流程
 
-改进:
-1. 彻底移除 extract_candidates 中的 Pandas 依赖，改用原生 Python 流式解析。
-   杜绝底层 df.values 带来的多行内存广播错误（导致 196万行变成同一行的幽灵 BUG）。
-2. 在 extract_candidates 加入探针，显式打印前两条候选样本的坐标以供核对。
-3. 强化全息诊断引擎，无论提取是否丢弃序列，均输出报告确保绝对透明。
 """
 
 import math
+import subprocess
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -18,8 +14,7 @@ import numpy as np
 import pysam
 
 from config import (
-    BOWTIE2,
-    BOWTIE2_BUILD,
+    BWA,
     DEFAULT_MICRO_CLUSTER_MAX_LEN,
     DEFAULT_MICRO_EXEMPT_FOLD_CHANGE,
     DEFAULT_MICRO_FOLD_CHANGE,
@@ -35,10 +30,11 @@ from config import (
     SAMTOOLS,
 )
 from ..utils import (
+    check_bwa_index,
     ensure_bam_index,
+    ensure_bwa_index,
     ensure_faidx,
     is_bam_valid,
-    resolve_bowtie2_index,
     run_command,
     setup_logger,
 )
@@ -77,10 +73,7 @@ class MicroCoveragePipeline:
                 f"Please place reference genome into {self.ref_genome.parent}/"
             )
 
-        prefix, _ = resolve_bowtie2_index(self.ref_genome)
-        self.index_prefix = prefix
         self._index_checked = False
-
         ensure_faidx(self.ref_genome, SAMTOOLS)
 
         self.window_size = int(window_size)
@@ -108,16 +101,14 @@ class MicroCoveragePipeline:
         }
 
     def build_index(self) -> None:
-        """构建 Bowtie2 索引 (若缺失)"""
-        prefix, exists = resolve_bowtie2_index(self.ref_genome)
-        self.index_prefix = prefix
-        if exists:
-            logger.debug(f"Bowtie2 index already exists at {self.index_prefix}, skip building.")
+        """构建 BWA 索引 (若缺失)"""
+        if check_bwa_index(self.ref_genome):
+            logger.debug(f"BWA index already exists for {self.ref_genome.name}, skip building.")
             self._index_checked = True
             return
 
-        logger.info(f"Building Bowtie2 index: {self.ref_genome} -> {self.index_prefix}")
-        run_command([BOWTIE2_BUILD, "-f", str(self.ref_genome), str(self.index_prefix)])
+        logger.info(f"Building BWA index for {self.ref_genome.name} (this may take a few minutes)...")
+        ensure_bwa_index(self.ref_genome, BWA)
         self._index_checked = True
 
     def align(
@@ -128,7 +119,7 @@ class MicroCoveragePipeline:
         threads: int = 8,
         force_align: bool = False,
     ) -> Path:
-        """FASTQ -> sorted & indexed BAM (支持复用已存在的有效 BAM 与索引)"""
+        """FASTQ -> BWA-MEM 流式比对并管道排序输出 BAM (支持复用已存在的有效 BAM 与索引)"""
         fastq1, fastq2 = Path(fastq1), Path(fastq2)
         bam_file = self.output_dir / f"{sample_name}.bam"
 
@@ -144,20 +135,14 @@ class MicroCoveragePipeline:
         if not self._index_checked:
             self.build_index()
 
-        sam_file = self.output_dir / f"{sample_name}.sam"
-
-        logger.info(f"[{sample_name}] bowtie2 aligning ({threads} threads) ...")
-        run_command([
-            BOWTIE2, "-p", str(threads),
-            "-x", str(self.index_prefix),
-            "-1", str(fastq1), "-2", str(fastq2),
-            "-S", str(sam_file),
-            "--no-unal",
-        ])
-
-        logger.info(f"[{sample_name}] samtools sort -> {bam_file.name} ...")
-        run_command([SAMTOOLS, "sort", f"-@{threads}", "-o", str(bam_file), str(sam_file)])
-        sam_file.unlink(missing_ok=True)
+        logger.info(f"[{sample_name}] bwa mem aligning ({threads} threads) & stream sorting -> {bam_file.name} ...")
+        cmd = (
+            f"{BWA} mem -t {threads} {self.ref_genome} {fastq1} {fastq2} | "
+            f"{SAMTOOLS} sort -@{threads} -o {bam_file}"
+        )
+        res = subprocess.run(["bash", "-o", "pipefail", "-c", cmd], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"BWA-MEM alignment failed:\n{res.stderr}")
 
         logger.info(f"[{sample_name}] Ensuring BAM index for {bam_file.name} ...")
         ensure_bam_index(bam_file, SAMTOOLS)
@@ -301,10 +286,14 @@ class MicroCoveragePipeline:
 
                 try:
                     for read in bam.fetch(chrom):
+                        # 核心防重复加权保障: 排除 unmapped, duplicate, secondary 和 supplementary
+                        # 仅保留主比对 (Primary Alignment)，由于 BWA-MEM 会软剪切嵌合接头，
+                        # 主比对不仅质量值 MAPQ 高，且精确记录参考基因组匹配跨度 (reference_end - reference_start)
                         if (
                             read.is_unmapped
                             or read.is_duplicate
                             or read.is_secondary
+                            or read.is_supplementary
                             or read.mapping_quality < 20
                             or read.reference_start is None
                             or read.reference_end is None
@@ -442,19 +431,17 @@ class MicroCoveragePipeline:
         candidates = []
         n_total = 0
 
-        # 🚀【核心修复】：完全放弃 Pandas 库的解析，改用原生 Python 逐行解析。
-        # 彻底杜绝由于特殊长文本文件导致的 numpy.values 内存广播断层 BUG！
+        # 原生 Python 逐行解析，杜绝内存广播错误
         with open(call_cns, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                # 过滤空行、参数行及表头
                 if not line or line.startswith("#") or line.startswith("chromosome"):
                     continue
-                
+
                 parts = line.split()
                 if len(parts) < 4:
                     continue
-                    
+
                 n_total += 1
                 try:
                     chrom = str(parts[0]).strip()
@@ -463,17 +450,16 @@ class MicroCoveragePipeline:
                     log2_val = float(parts[3])
                 except ValueError:
                     continue
-                    
+
                 size = end - start
-                
-                # 执行过滤逻辑
+
                 if min_log2 is not None and log2_val < min_log2:
                     continue
                 if min_size and size < min_size:
                     continue
                 if max_size and size > max_size:
                     continue
-                    
+
                 candidates.append({
                     "name": f"{prefix}mcv{len(candidates)}",
                     "chrom": chrom,
@@ -487,13 +473,12 @@ class MicroCoveragePipeline:
             f"[{call_cns.name}] Segments: {n_total} total -> {len(candidates)} after filtering "
             f"(min_log2={min_log2}, min_size={min_size}, max_size={max_size})"
         )
-        
-        # 【断言探针】：打印出解析结果的前2条，绝对确认数组没有变成完全一致的脏数据！
+
         if len(candidates) > 0:
             logger.info(f"Diagnostic - Sample 0: {candidates[0]['chrom']}:{candidates[0]['start']}-{candidates[0]['end']}")
             if len(candidates) > 1:
                 logger.info(f"Diagnostic - Sample 1: {candidates[1]['chrom']}:{candidates[1]['start']}-{candidates[1]['end']}")
-            
+
         return candidates
 
     def extract_sequences(self, candidates: List[Dict], output_fa: Path) -> int:
@@ -505,7 +490,6 @@ class MicroCoveragePipeline:
 
         ensure_faidx(self.ref_genome, SAMTOOLS)
 
-        # 构建防复用集合 (使用原生遍历，确保每个独立的区间都被记录)
         uniq, seen = [], set()
         for c in candidates:
             key = (c["chrom"], c["start"], c["end"])
@@ -523,14 +507,13 @@ class MicroCoveragePipeline:
 
         with pysam.FastaFile(str(self.ref_genome)) as fa, open(output_fa, "w", encoding="utf-8") as f:
             ref_chroms = list(fa.references)
-            
-            # 安全染色体映射字典
+
             chrom_map = {}
             for chrom in ref_chroms:
                 chrom_map[chrom] = chrom
                 chrom_map[chrom.lower()] = chrom
                 chrom_map[chrom.upper()] = chrom
-            
+
             for chrom in ref_chroms:
                 cl = chrom.lower()
                 if cl.startswith("chr"):
@@ -554,7 +537,7 @@ class MicroCoveragePipeline:
                 chrom_len = fa.get_reference_length(ref_chrom)
                 start = max(1, int(c["start"]))
                 end = min(int(c["end"]), chrom_len)
-                
+
                 if start > end or start > chrom_len:
                     diag_out_of_bounds += 1
                     continue
@@ -582,7 +565,7 @@ class MicroCoveragePipeline:
             f"Fetch errors: {diag_fetch_err} | "
             f"Empty strings: {diag_empty}"
         )
-        
+
         return written
 
     @staticmethod

@@ -1,11 +1,6 @@
 """
 src/dataprocess.py - 序列预处理与编码
 
-关键修复 (相对旧版):
-1. 字符串清洗正确赋值 (原版 seq.replace() 结果被丢弃)
-2. One-hot 编码向量化实现 (原版为纯 Python 循环, 慢 ~50 倍)
-3. parse_fasta_header 正确处理 '>SampleID|chr1:100-200|eccDNA' 以及带浮点数格式如 '>chr13:52514242.0-52514642.0'
-4. 长度使用完整 len(seq) (原版 n=len-1 是 off-by-one bug)
 """
 import random
 import re

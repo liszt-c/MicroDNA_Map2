@@ -1,10 +1,6 @@
 """
 scripts/verify.py - 模型全量量化评估报告与混淆矩阵绘制
 
-特性:
-  1. 支持评估单折模型在专属 Held-out 测试染色体上的泛化性能 (--fold 1..5)
-  2. 支持评估 5 折集成模型 (Ensemble)
-  3. 自动计算 ACC, AUC, PR-AUC, Sensitivity/Recall, Specificity, F1, MCC
 """
 import argparse
 import sys

@@ -1,15 +1,15 @@
 """
-src/pipeline/cnvkit_pipeline.py - CNVkit 分析流程封装 (同步修复安全提取与清理逻辑)
+src/pipeline/cnvkit_pipeline.py - CNVkit 分析流程封装
 """
+import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Dict, List, Optional
 
 import pandas as pd
 import pysam
 
 from config import (
-    BOWTIE2,
-    BOWTIE2_BUILD,
+    BWA,
     CNVKIT,
     CNVKIT_REF_CNN,
     CNVKIT_TEMP_DIR,
@@ -17,10 +17,11 @@ from config import (
     SAMTOOLS,
 )
 from ..utils import (
+    check_bwa_index,
     ensure_bam_index,
+    ensure_bwa_index,
     ensure_faidx,
     is_bam_valid,
-    resolve_bowtie2_index,
     run_command,
     setup_logger,
 )
@@ -39,25 +40,21 @@ class CNVKitPipeline:
         if not self.ref_genome.exists():
             raise FileNotFoundError(
                 f"Reference genome not found: {self.ref_genome}\n"
-                f"Please place hg19.fa into {self.ref_genome.parent}/"
+                f"Please place reference genome into {self.ref_genome.parent}/"
             )
-        prefix, _ = resolve_bowtie2_index(self.ref_genome)
-        self.index_prefix = prefix
-        self._index_checked = False
 
+        self._index_checked = False
         ensure_faidx(self.ref_genome, SAMTOOLS)
 
     def build_index(self):
-        """构建 Bowtie2 索引 (若缺失)"""
-        prefix, exists = resolve_bowtie2_index(self.ref_genome)
-        self.index_prefix = prefix
-        if exists:
-            logger.debug(f"Bowtie2 index already exists at {self.index_prefix}, skip building.")
+        """构建 BWA 索引 (若缺失)"""
+        if check_bwa_index(self.ref_genome):
+            logger.debug(f"BWA index already exists for {self.ref_genome.name}, skip building.")
             self._index_checked = True
             return
 
-        logger.info(f"Building Bowtie2 index: {self.ref_genome} -> {self.index_prefix}")
-        run_command([BOWTIE2_BUILD, "-f", str(self.ref_genome), str(self.index_prefix)])
+        logger.info(f"Building BWA index for {self.ref_genome.name}...")
+        ensure_bwa_index(self.ref_genome, BWA)
         self._index_checked = True
 
     def align(
@@ -68,7 +65,7 @@ class CNVKitPipeline:
         threads: int = 8,
         force_align: bool = False,
     ) -> Path:
-        """FASTQ -> sorted & indexed BAM (支持复用已存在的有效 BAM 与索引)"""
+        """FASTQ -> BWA-MEM 流式比对并管道排序输出 BAM"""
         fastq1, fastq2 = Path(fastq1), Path(fastq2)
         bam_file = self.output_dir / f"{sample_name}.bam"
 
@@ -84,22 +81,14 @@ class CNVKitPipeline:
         if not self._index_checked:
             self.build_index()
 
-        sam_file = self.output_dir / f"{sample_name}.sam"
-
-        logger.info(f"[{sample_name}] bowtie2 aligning ({threads} threads) ...")
-        run_command([
-            BOWTIE2, "-p", str(threads),
-            "-x", str(self.index_prefix),
-            "-1", str(fastq1), "-2", str(fastq2),
-            "-S", str(sam_file),
-        ])
-
-        logger.info(f"[{sample_name}] samtools sort -> {bam_file.name} ...")
-        run_command([SAMTOOLS, "sort", f"-@{threads}", "-o", str(bam_file), str(sam_file)])
-        try:
-            sam_file.unlink()
-        except OSError as e:
-            logger.warning(f"Failed to remove {sam_file}: {e}")
+        logger.info(f"[{sample_name}] bwa mem aligning ({threads} threads) & stream sorting -> {bam_file.name} ...")
+        cmd = (
+            f"{BWA} mem -t {threads} {self.ref_genome} {fastq1} {fastq2} | "
+            f"{SAMTOOLS} sort -@{threads} -o {bam_file}"
+        )
+        res = subprocess.run(["bash", "-o", "pipefail", "-c", cmd], capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"BWA-MEM alignment failed:\n{res.stderr}")
 
         logger.info(f"[{sample_name}] Ensuring BAM index for {bam_file.name} ...")
         ensure_bam_index(bam_file, SAMTOOLS)

@@ -2,7 +2,6 @@
 """
 benchmark/perturbation_test.py - 模型特征依赖性验证 (扰动测试)
 
-功能逻辑分离 (低耦合高内聚):
   - Task 'infer': 加载模型权重，提取高分序列进行打乱和饱和突变推断，保存统计结果至 CSV。
   - Task 'plot': 读取已生成的 CSV 文件，绘制小提琴图(Violin Plot)和热图(Heatmap)。
   - Task 'all': 顺序执行上述两步。

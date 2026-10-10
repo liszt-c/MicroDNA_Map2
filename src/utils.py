@@ -1,5 +1,5 @@
 """
-src/utils.py - 通用工具函数 (增强 pysam 原生极速安全提取)
+src/utils.py - 通用工具函数 (增强 pysam 原生极速安全提取与 BWA 索引管理)
 """
 import logging
 import os
@@ -99,8 +99,8 @@ def iter_fasta_file(path: Path) -> Iterator[Tuple[str, str]]:
             else:
                 if header is not None:
                     parts.append(line)
-    if header is not None:
-        yield header, ''.join(parts)
+        if header is not None:
+            yield header, ''.join(parts)
 
 
 def read_fai(ref_fa: Path) -> dict:
@@ -173,26 +173,21 @@ def ensure_bam_index(bam_path: Path, samtools_bin: str = 'samtools') -> Path:
     return bai1 if bai1.exists() else bai2
 
 
-def resolve_bowtie2_index(ref_genome: Path) -> Tuple[Path, bool]:
-    """检查参考基因组对应的 Bowtie2 索引是否存在"""
+def check_bwa_index(ref_genome: Path) -> bool:
+    """检查参考基因组的 BWA 索引文件是否齐全"""
     ref_genome = Path(ref_genome)
-    parent = ref_genome.parent
-    prefixes = [parent / ref_genome.stem, parent / ref_genome.name]
+    bwa_exts = [".amb", ".ann", ".bwt", ".pac", ".sa"]
+    return all(Path(str(ref_genome) + ext).exists() and Path(str(ref_genome) + ext).stat().st_size > 0 for ext in bwa_exts)
 
-    for prefix in prefixes:
-        prefix_str = str(prefix)
-        has_small = all(
-            Path(f"{prefix_str}{ext}").exists() and Path(f"{prefix_str}{ext}").stat().st_size > 0
-            for ext in [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
-        )
-        has_large = all(
-            Path(f"{prefix_str}{ext}").exists() and Path(f"{prefix_str}{ext}").stat().st_size > 0
-            for ext in [".1.bt2l", ".2.bt2l", ".3.bt2l", ".4.bt2l", ".rev.1.bt2l", ".rev.2.bt2l"]
-        )
-        if has_small or has_large:
-            return prefix, True
 
-    return prefixes[0], False
+def ensure_bwa_index(ref_genome: Path, bwa_bin: str = 'bwa') -> None:
+    """确保参考基因组已建立 BWA 索引，若缺失则自动调用 bwa index 构建"""
+    ref_genome = Path(ref_genome)
+    if not ref_genome.exists():
+        raise FileNotFoundError(f"Reference genome not found: {ref_genome}")
+    if check_bwa_index(ref_genome):
+        return
+    run_command([bwa_bin, "index", str(ref_genome)])
 
 
 def extract_regions(ref_fa: Path, regions: list, samtools_bin: str = 'samtools'):

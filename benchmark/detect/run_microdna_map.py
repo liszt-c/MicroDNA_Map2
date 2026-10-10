@@ -47,33 +47,31 @@ def run_cmd(cmd: list, cwd: Optional[Path] = None, check: bool = True) -> int:
     return result.returncode
 
 
-def check_bowtie2_index(ref_prefix: Path) -> bool:
-    """检查 32-bit 或 64-bit (bt2l) 的 Bowtie2 索引是否存在"""
-    idx_ext = [".1.bt2", ".2.bt2", ".3.bt2", ".4.bt2", ".rev.1.bt2", ".rev.2.bt2"]
-    idx_ext_l = [".1.bt2l", ".2.bt2l", ".3.bt2l", ".4.bt2l", ".rev.1.bt2l", ".rev.2.bt2l"]
-    has_small = all(Path(str(ref_prefix) + ext).exists() for ext in idx_ext)
-    has_large = all(Path(str(ref_prefix) + ext).exists() for ext in idx_ext_l)
-    return has_small or has_large
+def check_bwa_index(reference: Path) -> bool:
+    """检查 BWA 索引文件是否齐全"""
+    bwa_exts = [".amb", ".ann", ".bwt", ".pac", ".sa"]
+    return all(Path(str(reference) + ext).exists() and Path(str(reference) + ext).stat().st_size > 0 for ext in bwa_exts)
 
 
-def build_bowtie2_index(reference_fasta: Path, output_prefix: Path) -> None:
-    if check_bowtie2_index(output_prefix):
-        print(f"[INFO] Bowtie2 索引已存在: {output_prefix}")
+def build_bwa_index(reference: Path) -> None:
+    """若 BWA 索引缺失则构建"""
+    if check_bwa_index(reference):
+        print(f"[INFO] BWA 索引已存在: {reference}")
         return
-    print(f"[INFO] 构建 Bowtie2 索引: {output_prefix}")
-    run_cmd(["bowtie2-build", str(reference_fasta), str(output_prefix)], check=True)
+    print(f"[INFO] 构建 BWA 索引: {reference}")
+    run_cmd(["bwa", "index", str(reference)], check=True)
 
 
-def align_and_sort_reads(r1: Path, r2: Path, ref_prefix: Path, output_bam: Path, threads: int) -> None:
-    print(f"[INFO] 比对 reads: {r1.name} & {r2.name}")
+def align_and_sort_reads(r1: Path, r2: Path, reference: Path, output_bam: Path, threads: int) -> None:
+    print(f"[INFO] BWA-MEM 比对 reads: {r1.name} & {r2.name}")
     cmd = (
-        f"bowtie2 -p {threads} -x {ref_prefix} -1 {r1} -2 {r2} --no-unal | "
+        f"bwa mem -t {threads} {reference} {r1} {r2} | "
         f"samtools sort -@{threads} -o {output_bam}"
     )
     ret = subprocess.run(cmd, shell=True, executable="/bin/bash", capture_output=True, text=True)
     if ret.returncode != 0:
-        raise RuntimeError(f"比对失败: {ret.stderr}")
-    print(f"[INFO] 比对完成: {output_bam}")
+        raise RuntimeError(f"BWA 比对失败:\n{ret.stderr}")
+    print(f"[INFO] 比对并排序完成: {output_bam}")
 
 
 def index_bam(bam_path: Path, threads: int) -> None:
@@ -266,12 +264,11 @@ def run_microdna_map(
     log_file = output_dir / "microdna_map.log"
     total_start = time.time()
 
-    # 1. 统一 Bowtie2 索引路径：直接复用参考基因组同目录索引，避免每次在 output_dir 中重复构建
-    ref_prefix = reference.parent / reference.stem
-    build_bowtie2_index(reference, ref_prefix)
+    # 1. 统一构建并检查 BWA 索引
+    build_bwa_index(reference)
 
     bam_path = output_dir / "aligned.sorted.bam"
-    align_and_sort_reads(r1, r2, ref_prefix, bam_path, threads)
+    align_and_sort_reads(r1, r2, reference, bam_path, threads)
     index_bam(bam_path, threads)
 
     # 2. 候选区域生成
@@ -351,7 +348,7 @@ def main() -> None:
     parser.add_argument("--fold_change", type=float, default=1.3, help="微尺度分析富集倍数阈值")
     args = parser.parse_args()
 
-    required_tools = ["bowtie2", "samtools"]
+    required_tools = ["bwa", "samtools"]
     if args.pipeline == "cnvkit":
         required_tools.append("cnvkit.py")
 
